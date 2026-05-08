@@ -39,7 +39,7 @@ const CONFIG = {
   // Agents who use Zendesk but are NOT on the support team — exclude from all dashboard stats
   excludeAgents: ["Excluded"],
   // Aircall lines to exclude from SMS activity tracking
-  excludeSMSLines: ["nonpro sales (post close)", "Agent D", "Agent E", "Agent F", "Agent G", "Agent H", "Agent I", "Agent J", "Agent K"],
+  excludeSMSLines: ["nonpro sales (post close)", "Agent D", "Agent E", "Agent F", "Agent G", "Agent H", "Agent I", "Agent J", "Agent K", "Agent L"],
   // Business hours for phone metrics (calls outside these hours excluded from answer rate)
   businessHours: {
     timezone: "America/Los_Angeles",  // Pacific
@@ -59,6 +59,7 @@ const DEFAULT_THRESHOLDS = {
   phoneAnswerRate:  { green: 75, yellow: 60 },     // % — Goal: 75%+ answer rate
   medianFRT:        { green: 12, yellow: 24 },     // hours — 12h = Green per SLA
   avgWaitTime:      { green: 30, yellow: 60 },     // seconds
+  socialResponseTime: { green: 120, yellow: 360 }, // minutes — 2h = Healthy, 6h = At Risk
 };
 
 // Load thresholds from Script Properties with fallback to defaults.
@@ -99,6 +100,10 @@ function loadThresholds() {
     avgWaitTime: {
       green:  num("SLA_WAIT_GREEN",  d.avgWaitTime.green),
       yellow: num("SLA_WAIT_YELLOW", d.avgWaitTime.yellow),
+    },
+    socialResponseTime: {
+      green:  num("SLA_SOCIAL_GREEN",  d.socialResponseTime.green),
+      yellow: num("SLA_SOCIAL_YELLOW", d.socialResponseTime.yellow),
     },
   };
 }
@@ -957,7 +962,7 @@ function writeDashboard(ss, zendesk, aircall, csat, postCall, sms, meta) {
   // Swap staging content → Dashboard in one batch
   const dash = getOrCreateSheet(ss, "Dashboard");
   const lastRow = staging.getLastRow() || 1;
-  const lastCol = Math.max(staging.getLastColumn(), 14);
+  const lastCol = Math.max(staging.getLastColumn(), 24);
 
   // Clear dashboard and paste all content + formatting from staging
   dash.clear();
@@ -1006,7 +1011,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   const risk     = "#A85353";            // softened operational red (brand-adjacent)
   const riskLt   = BRAND.roseQuartzLight;// #D6BDC8 — subtle risk tint
 
-  dash.getRange("A:N").setFontFamily("Inter").setFontColor(darkText).setBackground(bg);
+  dash.getRange("A:X").setFontFamily("Inter").setFontColor(darkText).setBackground(bg);
   dash.setTabColor(navy);
   dash.setHiddenGridlines(true);
 
@@ -1022,6 +1027,15 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     : aircall.teamAnswerRate >= phoneYellow ? "Watch" : "At Risk";
   const phoneColor = phoneStatus === "At Risk" ? risk
     : phoneStatus === "Watch" ? amber : green;
+
+  // Social status — based on oldest unread DM response time
+  const socialOldestWaitMin = computeSocialOldestWait(meta);
+  const socialGreen = CONFIG.thresholds.socialResponseTime.green;
+  const socialYellow = CONFIG.thresholds.socialResponseTime.yellow;
+  const socialStatus = socialOldestWaitMin <= socialGreen ? "Healthy"
+    : socialOldestWaitMin <= socialYellow ? "Watch" : "At Risk";
+  const socialColor = socialStatus === "At Risk" ? risk
+    : socialStatus === "Watch" ? amber : green;
 
   // Derived values
   const oldestWaitMin = zendesk.longest10.length > 0 ? zendesk.longest10[0].waitBizMin : 0;
@@ -1039,12 +1053,12 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     .setFontSize(13).setFontWeight("bold")
     .setVerticalAlignment("middle");
   // Title
-  dash.getRange("C1:H1").merge()
+  dash.getRange("C1:P1").merge()
     .setValue("CS Command Center")
     .setBackground(navy).setFontColor(BRAND.airBlueLight)
     .setFontSize(13).setVerticalAlignment("middle");
   // Timestamp right-aligned
-  dash.getRange("I1:N1").merge()
+  dash.getRange("Q1:X1").merge()
     .setValue(`Status as of ${timestamp}`)
     .setBackground(navy).setFontColor(BRAND.airBlueMedium)
     .setFontSize(9)
@@ -1052,7 +1066,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   dash.setRowHeight(1, 36);
 
   // ═══════════════════════════════════════════════
-  // ROW 2: Channel status strip
+  // ROW 2: Channel status strip (3 channels)
   // ═══════════════════════════════════════════════
   dash.getRange("A2:G2").merge()
     .setValue(`Email: ${emailStatus}`)
@@ -1060,9 +1074,15 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     .setFontSize(14).setFontWeight("bold")
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
   dash.getRange("H2").setBackground(bg);
-  dash.getRange("I2:N2").merge()
+  dash.getRange("I2:O2").merge()
     .setValue(`Phone: ${phoneStatus}`)
     .setBackground(bg).setFontColor(phoneColor)
+    .setFontSize(14).setFontWeight("bold")
+    .setHorizontalAlignment("center").setVerticalAlignment("middle");
+  dash.getRange("P2").setBackground(bg);
+  dash.getRange("Q2:X2").merge()
+    .setValue(`Social: ${socialStatus}`)
+    .setBackground(bg).setFontColor(socialColor)
     .setFontSize(14).setFontWeight("bold")
     .setHorizontalAlignment("center").setVerticalAlignment("middle");
   dash.setRowHeight(2, 34);
@@ -1075,24 +1095,24 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   if (showAlert) {
     const alertRed = "#B91C1C";      // deep red background
     const alertRedLight = "#FEE2E2"; // light red for accent
-    dash.getRange("A3:N3").merge()
+    dash.getRange("A3:X3").merge()
       .setValue(`⚠  ALL HANDS ON DECK  —  ${zendesk.unassigned} UNASSIGNED TICKETS  ⚠`)
       .setBackground(alertRed).setFontColor("#FFFFFF")
       .setFontSize(18).setFontWeight("bold")
       .setHorizontalAlignment("center").setVerticalAlignment("middle");
     dash.setRowHeight(3, 56);
-    dash.getRange("A4:N4").merge()
+    dash.getRange("A4:X4").merge()
       .setValue("Unassigned ticket count has exceeded " + UNASSIGNED_ALERT_THRESHOLD + ". All available agents should begin triaging unassigned tickets immediately.")
       .setBackground(alertRedLight).setFontColor(alertRed)
       .setFontSize(11).setFontWeight("bold")
       .setHorizontalAlignment("center").setVerticalAlignment("middle");
     dash.setRowHeight(4, 32);
     // Row 5: divider after alert
-    dash.getRange("A5:N5").setBackground(divider);
+    dash.getRange("A5:X5").setBackground(divider);
     dash.setRowHeight(5, 2);
   } else {
     // Row 3: normal thin divider
-    dash.getRange("A3:N3").setBackground(divider);
+    dash.getRange("A3:X3").setBackground(divider);
     dash.setRowHeight(3, 2);
   }
 
@@ -1103,8 +1123,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   // KPI panels (numbers on top, labels below)
   // ═══════════════════════════════════════════════
 
-  // Column H: spacer between email/phone halves
-  dash.setColumnWidth(8, 20);
+  // Column H & P: spacers between columns
+  dash.setColumnWidth(8, 20);   // H spacer
+  dash.setColumnWidth(16, 20);  // P spacer
 
   // --- ROW 4: Big numbers ---
   const k1 = 4 + alertOffset;
@@ -1140,8 +1161,25 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     .setFontSize(18).setFontWeight("bold").setFontColor(darkText)
     .setVerticalAlignment("bottom").setHorizontalAlignment("left");
   // Outbound calls — raw total
-  dash.getRange(`M${k1}:N${k1}`).merge().setBackground(cardBg)
+  dash.getRange(`M${k1}:O${k1}`).merge().setBackground(cardBg)
     .setValue(aircall.totalOutbound).setNumberFormat("0")
+    .setFontSize(18).setFontWeight("bold").setFontColor(darkText)
+    .setVerticalAlignment("bottom").setHorizontalAlignment("left");
+
+  // Social KPIs — row 1: big numbers
+  const metaUnread = (meta && meta.unreadDMs) || 0;
+  const metaConversations = (meta && meta.recentConversations) || [];
+  const metaComments = (meta && meta.recentComments) || [];
+  dash.getRange(`Q${k1}:R${k1}`).merge().setBackground(cardBg)
+    .setValue(metaUnread).setNumberFormat("0")
+    .setFontSize(28).setFontWeight("bold").setFontColor(socialColor)
+    .setVerticalAlignment("bottom").setHorizontalAlignment("left");
+  dash.getRange(`S${k1}:T${k1}`).merge().setBackground(cardBg)
+    .setValue(Math.round(socialOldestWaitMin / 60)).setNumberFormat("0")
+    .setFontSize(18).setFontWeight("bold").setFontColor(darkText)
+    .setVerticalAlignment("bottom").setHorizontalAlignment("left");
+  dash.getRange(`U${k1}:X${k1}`).merge().setBackground(cardBg)
+    .setValue(metaComments.length).setNumberFormat("0")
     .setFontSize(18).setFontWeight("bold").setFontColor(darkText)
     .setVerticalAlignment("bottom").setHorizontalAlignment("left");
 
@@ -1166,8 +1204,19 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   dash.getRange(`K${k2}:L${k2}`).merge().setBackground(cardBg)
     .setValue("Answered")
     .setFontSize(8).setFontColor(label).setVerticalAlignment("top");
-  dash.getRange(`M${k2}:N${k2}`).merge().setBackground(cardBg)
+  dash.getRange(`M${k2}:O${k2}`).merge().setBackground(cardBg)
     .setValue("Outbound")
+    .setFontSize(8).setFontColor(label).setVerticalAlignment("top");
+
+  // Social labels — row 2
+  dash.getRange(`Q${k2}:R${k2}`).merge().setBackground(cardBg)
+    .setValue("Unread DMs")
+    .setFontSize(8).setFontColor(label).setVerticalAlignment("top");
+  dash.getRange(`S${k2}:T${k2}`).merge().setBackground(cardBg)
+    .setValue("Oldest DM Wait (h)")
+    .setFontSize(8).setFontColor(label).setVerticalAlignment("top");
+  dash.getRange(`U${k2}:X${k2}`).merge().setBackground(cardBg)
+    .setValue("Comments & Mentions (24h)")
     .setFontSize(8).setFontColor(label).setVerticalAlignment("top");
 
   // --- ROW 6: Queue counts (secondary numbers) ---
@@ -1194,7 +1243,15 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     .setValue(fwdCount).setNumberFormat("0")
     .setFontSize(16).setFontWeight("bold").setFontColor(fwdCount > 0 ? amber : navy)
     .setVerticalAlignment("bottom").setHorizontalAlignment("left");
-  dash.getRange(`K${k3}:N${k3}`).merge().setBackground(cardBg);
+  dash.getRange(`K${k3}:O${k3}`).merge().setBackground(cardBg);
+
+  // Social row 3: Total conversations
+  const totalConversations = metaConversations.length > 0 ? metaConversations.length : 0;
+  dash.getRange(`Q${k3}:R${k3}`).merge().setBackground(cardBg)
+    .setValue(totalConversations).setNumberFormat("0")
+    .setFontSize(16).setFontWeight("bold").setFontColor(darkText)
+    .setVerticalAlignment("bottom").setHorizontalAlignment("left");
+  dash.getRange(`S${k3}:X${k3}`).merge().setBackground(cardBg);
 
   // --- ROW 7: Labels under queue counts ---
   const k4 = 7 + alertOffset;
@@ -1223,7 +1280,12 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   dash.getRange(`I${k4}:J${k4}`).merge().setBackground(cardBg)
     .setValue("Sent to Answer Service")
     .setFontSize(8).setFontColor(navy).setVerticalAlignment("top");
-  dash.getRange(`K${k4}:N${k4}`).merge().setBackground(cardBg);
+  dash.getRange(`K${k4}:O${k4}`).merge().setBackground(cardBg);
+
+  dash.getRange(`Q${k4}:R${k4}`).merge().setBackground(cardBg)
+    .setValue("Conversations (24h)")
+    .setFontSize(8).setFontColor(navy).setVerticalAlignment("top");
+  dash.getRange(`S${k4}:X${k4}`).merge().setBackground(cardBg);
 
   // --- ROW 8: Status accent bar (thin colored line under KPI) ---
   const k5 = 8 + alertOffset;
@@ -1232,19 +1294,29 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     : emailStatus === "Watch" ? amberLt : BRAND.mossGreenLight;
   const phoneAccent = phoneStatus === "At Risk" ? riskLt
     : phoneStatus === "Watch" ? amberLt : BRAND.mossGreenLight;
+  const socialAccent = socialStatus === "At Risk" ? riskLt
+    : socialStatus === "Watch" ? amberLt : BRAND.mossGreenLight;
   dash.getRange(`A${k5}:G${k5}`).setBackground(emailAccent);
   dash.getRange(`H${k5}`).setBackground(bg);
-  dash.getRange(`I${k5}:N${k5}`).setBackground(phoneAccent);
+  dash.getRange(`I${k5}:O${k5}`).setBackground(phoneAccent);
+  dash.getRange(`P${k5}`).setBackground(bg);
+  dash.getRange(`Q${k5}:X${k5}`).setBackground(socialAccent);
 
   // Card borders around KPI panels for visual grouping
   const kpiBorder = { style: SpreadsheetApp.BorderStyle.SOLID, color: divider };
   dash.getRange(`A${k1}:G${k4}`).setBorder(true, true, true, true, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-  dash.getRange(`I${k1}:N${k4}`).setBorder(true, true, true, true, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+  dash.getRange(`I${k1}:O${k4}`).setBorder(true, true, true, true, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+  dash.getRange(`Q${k1}:X${k4}`).setBorder(true, true, true, true, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
 
   // Spacer row after KPIs
   const spacerRow = k5 + 1;
   dash.setRowHeight(spacerRow, 10);
-  dash.getRange(`A${spacerRow}:N${spacerRow}`).setBackground(bg);
+  dash.getRange(`A${spacerRow}:X${spacerRow}`).setBackground(bg);
+
+  // Gap column backgrounds for full height
+  const maxBodyRow = 2000; // will update after we know final row
+  dash.getRange(`H1:H${maxBodyRow}`).setBackground(bg);
+  dash.getRange(`P1:P${maxBodyRow}`).setBackground(bg);
 
   // ═══════════════════════════════════════════════
   // EMAIL TABLES (Columns A-G)
@@ -1533,14 +1605,12 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   }
 
   // ═══════════════════════════════════════════════
-  // PHONE TABLES (Columns I-N)
+  // PHONE TABLES (Columns I-O)
   // ═══════════════════════════════════════════════
-
-  dash.getRange(`H1:H${Math.max(tRow, 30)}`).setBackground(bg);
 
   // ─── Phone Activity by Agent ───
   const paHeaderRow = 10 + alertOffset;
-  dash.getRange(`I${paHeaderRow}:N${paHeaderRow}`).merge()
+  dash.getRange(`I${paHeaderRow}:O${paHeaderRow}`).merge()
     .setValue("Phone Activity by Agent")
     .setBackground(navy).setFontColor("#FFFFFF")
     .setFontSize(11).setFontWeight("bold").setVerticalAlignment("middle");
@@ -1559,11 +1629,11 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   dash.getRange(`J${pahRow1}`).setValue("In")
     .setFontWeight("bold").setFontSize(9).setFontColor(BRAND.beigeDark).setBackground(inboundBg).setHorizontalAlignment("right");
   dash.getRange(`J${pahRow1}`).setBorder(true, true, true, true, false, false, green, SpreadsheetApp.BorderStyle.SOLID);
-  // Outbound group header — spans K-N with tinted background
-  dash.getRange(`K${pahRow1}:N${pahRow1}`).merge().setValue("Outbound")
+  // Outbound group header — spans K-O with tinted background
+  dash.getRange(`K${pahRow1}:O${pahRow1}`).merge().setValue("Outbound")
     .setFontWeight("bold").setFontSize(9).setFontColor(navy).setBackground(outboundBg)
     .setHorizontalAlignment("center");
-  dash.getRange(`K${pahRow1}:N${pahRow1}`).setBorder(true, true, false, true, false, false, navy, SpreadsheetApp.BorderStyle.SOLID);
+  dash.getRange(`K${pahRow1}:O${pahRow1}`).setBorder(true, true, false, true, false, false, navy, SpreadsheetApp.BorderStyle.SOLID);
 
   const pahRow2 = pahRow1 + 1;
   dash.setRowHeight(pahRow2, 14);
@@ -1576,7 +1646,8 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     .setFontSize(8).setFontColor(navy).setBackground(outboundBg).setHorizontalAlignment("right");
   dash.getRange(`N${pahRow2}`).setValue("90s+")
     .setFontSize(8).setFontColor(navy).setBackground(outboundBg).setHorizontalAlignment("right");
-  dash.getRange(`K${pahRow2}:N${pahRow2}`).setBorder(false, true, true, true, false, false, navy, SpreadsheetApp.BorderStyle.SOLID);
+  dash.getRange(`O${pahRow2}`).setBackground(outboundBg);
+  dash.getRange(`K${pahRow2}:O${pahRow2}`).setBorder(false, true, true, true, false, false, navy, SpreadsheetApp.BorderStyle.SOLID);
 
   let paRow = pahRow2 + 1;
   CONFIG.agents.forEach(agent => {
@@ -1602,9 +1673,10 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     dash.getRange(`N${paRow}`)
       .setValue(stats.outboundLong).setNumberFormat("0").setHorizontalAlignment("right").setBackground(outboundBg).setFontSize(10)
       .setFontColor(stats.outboundLong > 0 ? green : gray);
+    dash.getRange(`O${paRow}`).setBackground(outboundBg);
     // Borders
-    dash.getRange(`K${paRow}:N${paRow}`).setBorder(false, true, false, true, false, false, navy, SpreadsheetApp.BorderStyle.SOLID);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`K${paRow}:O${paRow}`).setBorder(false, true, false, true, false, false, navy, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
   });
 
@@ -1614,7 +1686,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     phoneNotes.push(`${aircall.afterHoursCalls} call(s) outside biz hrs excluded`);
   }
   // SMS tracking now available via Aircall webhook
-  dash.getRange(`I${paRow}:N${paRow}`).merge()
+  dash.getRange(`I${paRow}:O${paRow}`).merge()
     .setValue(phoneNotes.join("  ·  "))
     .setFontColor(gray).setFontSize(8).setFontStyle("italic").setBackground(bg);
   paRow++;
@@ -1622,7 +1694,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   // ─── Missed Calls (detail table) ───
   paRow++; // spacer
   const missedDetails = aircall.missedCallDetails || [];
-  dash.getRange(`I${paRow}:N${paRow}`).merge()
+  dash.getRange(`I${paRow}:O${paRow}`).merge()
     .setValue("Missed Calls")
     .setBackground(navy).setFontColor("#FFFFFF")
     .setFontSize(11).setFontWeight("bold").setVerticalAlignment("middle");
@@ -1632,10 +1704,10 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   if (missedDetails.length === 0) {
     // Quiet empty state
     dash.setRowHeight(paRow, 22);
-    dash.getRange(`I${paRow}:N${paRow}`).merge()
+    dash.getRange(`I${paRow}:O${paRow}`).merge()
       .setValue("No missed calls today")
       .setFontSize(9).setFontColor(gray).setFontStyle("italic").setBackground(cardBg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
   } else {
     // Column headers: Line | Customer | Time | Reason
@@ -1646,9 +1718,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
     dash.getRange(`L${paRow}`).setValue("Time")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg).setHorizontalAlignment("right");
-    dash.getRange(`M${paRow}:N${paRow}`).merge().setValue("Reason")
+    dash.getRange(`M${paRow}:O${paRow}`).merge().setValue("Reason")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
 
     missedDetails.forEach(detail => {
@@ -1681,9 +1753,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
         .setFontColor(customerColor).setFontStyle(detail.callerNumber ? "normal" : "italic");
       dash.getRange(`L${paRow}`)
         .setValue(detail.callTime).setFontSize(9).setBackground(cardBg).setHorizontalAlignment("right");
-      dash.getRange(`M${paRow}:N${paRow}`).merge()
+      dash.getRange(`M${paRow}:O${paRow}`).merge()
         .setValue(detail.reason).setFontSize(9).setFontColor(amber).setBackground(cardBg);
-      dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+      dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
       paRow++;
     });
   }
@@ -1691,7 +1763,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   // ─── Phone CSAT Survey — PostCall (last 24h) ───
   paRow++; // spacer
   const pcResponses = (postCall && postCall.responses) || [];
-  dash.getRange(`I${paRow}:N${paRow}`).merge()
+  dash.getRange(`I${paRow}:O${paRow}`).merge()
     .setValue("Phone CSAT Survey")
     .setBackground(navy).setFontColor("#FFFFFF")
     .setFontSize(11).setFontWeight("bold").setVerticalAlignment("middle");
@@ -1700,10 +1772,10 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
 
   if (pcResponses.length === 0) {
     dash.setRowHeight(paRow, 22);
-    dash.getRange(`I${paRow}:N${paRow}`).merge()
+    dash.getRange(`I${paRow}:O${paRow}`).merge()
       .setValue("No surveys submitted in the last 24 hours")
       .setFontSize(9).setFontColor(gray).setFontStyle("italic").setBackground(cardBg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
   } else {
     // Summary line
@@ -1713,10 +1785,10 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     dash.getRange(`I${paRow}:J${paRow}`).merge()
       .setValue(pcScoreStr + " CSAT")
       .setFontSize(9).setFontWeight("bold").setFontColor(postCall.score !== null ? pcSumColor : gray).setBackground(bg);
-    dash.getRange(`K${paRow}:N${paRow}`).merge()
+    dash.getRange(`K${paRow}:O${paRow}`).merge()
       .setValue(`${postCall.satisfied} of ${postCall.total} satisfied`)
       .setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
 
     // Column headers
@@ -1727,9 +1799,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
     dash.getRange(`L${paRow}`).setValue("Agent")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`M${paRow}:N${paRow}`).merge().setValue("Time")
+    dash.getRange(`M${paRow}:O${paRow}`).merge().setValue("Time")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg).setHorizontalAlignment("right");
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
 
     pcResponses.forEach((r, pcIdx) => {
@@ -1744,9 +1816,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
         .setFontSize(9).setBackground(pcRowBg);
       dash.getRange(`L${paRow}`).setValue(r.agent ? r.agent.split(" ")[0] : "")
         .setFontSize(9).setBackground(pcRowBg);
-      dash.getRange(`M${paRow}:N${paRow}`).merge().setValue(r.dateStr + " " + r.timeStr)
+      dash.getRange(`M${paRow}:O${paRow}`).merge().setValue(r.dateStr + " " + r.timeStr)
         .setFontSize(9).setBackground(pcRowBg).setHorizontalAlignment("right");
-      dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+      dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
       paRow++;
     });
   }
@@ -1754,7 +1826,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   // ─── SMS Activity Today ───
   const smsData = sms || { totalToday: 0, inbound: 0, outbound: 0, agentStats: {}, messages: [] };
   paRow++; // spacer
-  dash.getRange(`I${paRow}:N${paRow}`).merge()
+  dash.getRange(`I${paRow}:O${paRow}`).merge()
     .setValue("SMS Activity Today")
     .setBackground(navy).setFontColor("#FFFFFF")
     .setFontSize(11).setFontWeight("bold").setVerticalAlignment("middle");
@@ -1763,23 +1835,23 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
 
   if (smsData.totalToday === 0) {
     dash.setRowHeight(paRow, 22);
-    dash.getRange(`I${paRow}:N${paRow}`).merge()
+    dash.getRange(`I${paRow}:O${paRow}`).merge()
       .setValue("No SMS activity today")
       .setFontSize(9).setFontColor(gray).setFontStyle("italic").setBackground(cardBg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
   } else {
     // Summary line: In X · Out X · Total X
     const smsSumColor = smsData.totalToday > 0 ? darkText : gray;
     dash.setRowHeight(paRow, 20);
-    dash.getRange(`I${paRow}:N${paRow}`).merge()
+    dash.getRange(`I${paRow}:O${paRow}`).merge()
       .setRichTextValue(
         SpreadsheetApp.newRichTextValue()
           .setText(`In: ${smsData.inbound}  ·  Out: ${smsData.outbound}  ·  Total: ${smsData.totalToday}`)
           .setTextStyle(SpreadsheetApp.newTextStyle().setFontSize(9).setForegroundColor(darkText).build())
           .build()
       ).setBackground(bg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
     paRow++;
 
     // Per-agent SMS counts (only show agents with activity)
@@ -1794,9 +1866,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
         .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
       dash.getRange(`K${paRow}:L${paRow}`).merge().setValue("Sent")
         .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg).setHorizontalAlignment("right");
-      dash.getRange(`M${paRow}:N${paRow}`).merge().setValue("Received")
+      dash.getRange(`M${paRow}:O${paRow}`).merge().setValue("Received")
         .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg).setHorizontalAlignment("right");
-      dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+      dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
       paRow++;
 
       smsAgentsWithActivity.forEach(agent => {
@@ -1806,9 +1878,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
           .setFontSize(9).setBackground(cardBg);
         dash.getRange(`K${paRow}:L${paRow}`).merge().setValue(s.sent)
           .setFontSize(9).setBackground(cardBg).setHorizontalAlignment("right");
-        dash.getRange(`M${paRow}:N${paRow}`).merge().setValue(s.received)
+        dash.getRange(`M${paRow}:O${paRow}`).merge().setValue(s.received)
           .setFontSize(9).setBackground(cardBg).setHorizontalAlignment("right");
-        dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+        dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
         paRow++;
       });
     }
@@ -1818,9 +1890,9 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     if (recentSMS.length > 0) {
       // Section sub-header
       dash.setRowHeight(paRow, 20);
-      dash.getRange(`I${paRow}:N${paRow}`).merge().setValue("Recent Messages")
+      dash.getRange(`I${paRow}:O${paRow}`).merge().setValue("Recent Messages")
         .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-      dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+      dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
       paRow++;
 
       recentSMS.forEach(m => {
@@ -1854,30 +1926,33 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
         if (m.body) {
           const truncBody = m.body.length > 120 ? m.body.substring(0, 117) + "..." : m.body;
           dash.setRowHeight(paRow, 18);
-          dash.getRange(`I${paRow}:N${paRow}`).merge().setValue(truncBody)
+          dash.getRange(`I${paRow}:O${paRow}`).merge().setValue(truncBody)
             .setFontSize(8).setFontColor(gray).setFontStyle("italic").setBackground(cardBg)
             .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
         } else {
           dash.setRowHeight(paRow, 4);
-          dash.getRange(`I${paRow}:N${paRow}`).merge().setBackground(cardBg);
+          dash.getRange(`I${paRow}:O${paRow}`).merge().setBackground(cardBg);
         }
-        dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+        dash.getRange(`I${paRow}:O${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
         paRow++;
       });
     }
   }
 
+
+  // ═══════════════════════════════════════════════
+  // SOCIAL TABLES (Columns Q-X)
+  // ═══════════════════════════════════════════════
+  let sRow = 10 + alertOffset;  // Social row counter (same starting row as phone/email)
+
   // ─── Social — Meta Business Suite (Messenger + Instagram) ───
-  const metaConversations = (meta && meta.recentConversations) || [];
-  const metaComments = (meta && meta.recentComments) || [];
-  const metaUnread = (meta && meta.unreadDMs) || 0;
-  paRow++; // spacer
-  dash.getRange(`I${paRow}:N${paRow}`).merge()
+  sRow++; // spacer to align with other sections
+  dash.getRange(`Q${sRow}:X${sRow}`).merge()
     .setValue("Social — Meta Business Suite")
     .setBackground(navy).setFontColor("#FFFFFF")
     .setFontSize(11).setFontWeight("bold").setVerticalAlignment("middle");
-  dash.setRowHeight(paRow, 26);
-  paRow++;
+  dash.setRowHeight(sRow, 26);
+  sRow++;
 
   // Summary line — DMs + comments totals
   const metaStatusColor = metaUnread > 0 ? amber : green;
@@ -1887,74 +1962,74 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   const commentSummary = metaComments.length > 0
     ? `${metaComments.length} comment${metaComments.length !== 1 ? "s" : ""}/mention${metaComments.length !== 1 ? "s" : ""} (24h)`
     : "No new comments (24h)";
-  dash.setRowHeight(paRow, 20);
-  dash.getRange(`I${paRow}:J${paRow}`).merge()
+  dash.setRowHeight(sRow, 20);
+  dash.getRange(`Q${sRow}:S${sRow}`).merge()
     .setValue(metaSummary)
     .setFontSize(9).setFontWeight("bold").setFontColor(metaStatusColor).setBackground(bg);
-  dash.getRange(`K${paRow}:N${paRow}`).merge()
+  dash.getRange(`T${sRow}:X${sRow}`).merge()
     .setValue(commentSummary)
     .setFontSize(9).setFontColor(metaComments.length > 0 ? amber : gray).setBackground(bg);
-  dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-  paRow++;
+  dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+  sRow++;
 
   // Token expiry warning
   if (meta && meta.tokenWarning) {
-    dash.setRowHeight(paRow, 20);
-    dash.getRange(`I${paRow}:N${paRow}`).merge()
+    dash.setRowHeight(sRow, 20);
+    dash.getRange(`Q${sRow}:X${sRow}`).merge()
       .setValue(meta.tokenWarning)
       .setFontSize(9).setFontWeight("bold").setFontColor(risk).setBackground(riskLt);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-    paRow++;
+    dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    sRow++;
   }
 
   // ── DMs sub-header ──
-  dash.setRowHeight(paRow, 20);
-  dash.getRange(`I${paRow}:N${paRow}`).merge()
-    .setValue("Direct Messages")
+  dash.setRowHeight(sRow, 20);
+  dash.getRange(`Q${sRow}:X${sRow}`).merge()
+    .setValue("Direct Messages (Last 24h / Unread)")
     .setFontWeight("bold").setFontSize(9).setFontColor(darkText).setBackground(bg);
-  dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-  paRow++;
+  dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+  sRow++;
 
   if (metaConversations.length === 0) {
-    dash.setRowHeight(paRow, 22);
-    dash.getRange(`I${paRow}:N${paRow}`).merge()
+    dash.setRowHeight(sRow, 22);
+    dash.getRange(`Q${sRow}:X${sRow}`).merge()
       .setValue("No recent conversations")
       .setFontSize(9).setFontColor(gray).setFontStyle("italic").setBackground(cardBg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-    paRow++;
+    dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    sRow++;
   } else {
     // Column headers
-    dash.setRowHeight(paRow, 20);
-    dash.getRange(`I${paRow}`).setValue("Customer")
+    dash.setRowHeight(sRow, 20);
+    dash.getRange(`Q${sRow}`).setValue("Customer")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`J${paRow}`).setValue("Via")
+    dash.getRange(`R${sRow}`).setValue("Via")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`K${paRow}:L${paRow}`).merge().setValue("Last Message")
+    dash.getRange(`S${sRow}:U${sRow}`).merge().setValue("Last Message")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`M${paRow}`).setValue("From")
+    dash.getRange(`V${sRow}`).setValue("From")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`N${paRow}`).setValue("Time")
+    dash.getRange(`W${sRow}:X${sRow}`).merge().setValue("Time")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg).setHorizontalAlignment("right");
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-    paRow++;
+    dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    sRow++;
 
     // Show up to 10 conversations
     metaConversations.slice(0, 10).forEach((convo, cIdx) => {
       const rowBg = convo.unread > 0 ? amberLt : (cIdx % 2 === 1 ? altRow : cardBg);
 
       // Row 1: Customer name (hyperlinked), platform badge, from, time
-      dash.setRowHeight(paRow, 20);
-      dash.getRange(`I${paRow}`)
+      dash.setRowHeight(sRow, 20);
+      dash.getRange(`Q${sRow}`)
         .setFormula(`=HYPERLINK("${convo.inboxUrl}","${convo.customerName.replace(/"/g, '""')}")`)
         .setFontSize(9).setFontColor("#1155CC").setBackground(rowBg);
       // Platform badge
       const platformShort = convo.platform === "Instagram" ? "IG" : "FB";
       const platformColor = convo.platform === "Instagram" ? "#C13584" : "#1877F2";
-      dash.getRange(`J${paRow}`).setValue(platformShort)
+      dash.getRange(`R${sRow}`).setValue(platformShort)
         .setFontSize(8).setFontWeight("bold").setFontColor(platformColor).setBackground(rowBg);
-      dash.getRange(`K${paRow}:L${paRow}`).merge()
+      dash.getRange(`S${sRow}:U${sRow}`).merge()
         .setBackground(rowBg);
-      dash.getRange(`M${paRow}`).setValue(convo.lastMessageFrom)
+      dash.getRange(`V${sRow}`).setValue(convo.lastMessageFrom)
         .setFontSize(8).setFontColor(gray).setBackground(rowBg);
 
       // Format time
@@ -1965,73 +2040,73 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
           timeDisplay = Utilities.formatDate(d, Session.getScriptTimeZone(), "MMM d h:mm a");
         } catch (e) { timeDisplay = ""; }
       }
-      dash.getRange(`N${paRow}`).setValue(timeDisplay)
+      dash.getRange(`W${sRow}:X${sRow}`).merge().setValue(timeDisplay)
         .setFontSize(8).setFontColor(gray).setBackground(rowBg).setHorizontalAlignment("right");
-      paRow++;
+      sRow++;
 
       // Row 2: message excerpt
-      dash.setRowHeight(paRow, 18);
+      dash.setRowHeight(sRow, 18);
       const excerpt = convo.lastMessage || "";
-      dash.getRange(`I${paRow}:N${paRow}`).merge().setValue(excerpt)
+      dash.getRange(`Q${sRow}:X${sRow}`).merge().setValue(excerpt)
         .setFontSize(8).setFontColor(gray).setFontStyle("italic").setBackground(rowBg)
         .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
-      dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-      paRow++;
+      dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+      sRow++;
     });
   }
 
   // ── Comments & Mentions sub-header (last 24h) ──
-  paRow++; // spacer
-  dash.setRowHeight(paRow, 20);
-  dash.getRange(`I${paRow}:N${paRow}`).merge()
+  sRow++; // spacer
+  dash.setRowHeight(sRow, 20);
+  dash.getRange(`Q${sRow}:X${sRow}`).merge()
     .setValue("Comments & Mentions (Last 24h)")
     .setFontWeight("bold").setFontSize(9).setFontColor(darkText).setBackground(bg);
-  dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-  paRow++;
+  dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+  sRow++;
 
   if (metaComments.length === 0) {
-    dash.setRowHeight(paRow, 22);
-    dash.getRange(`I${paRow}:N${paRow}`).merge()
+    dash.setRowHeight(sRow, 22);
+    dash.getRange(`Q${sRow}:X${sRow}`).merge()
       .setValue("No new comments or mentions")
       .setFontSize(9).setFontColor(gray).setFontStyle("italic").setBackground(cardBg);
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-    paRow++;
+    dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    sRow++;
   } else {
     // Column headers
-    dash.setRowHeight(paRow, 20);
-    dash.getRange(`I${paRow}`).setValue("Author")
+    dash.setRowHeight(sRow, 20);
+    dash.getRange(`Q${sRow}`).setValue("Author")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`J${paRow}`).setValue("Source")
+    dash.getRange(`R${sRow}`).setValue("Source")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`K${paRow}:L${paRow}`).merge().setValue("Comment")
+    dash.getRange(`S${sRow}:U${sRow}`).merge().setValue("Comment")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`M${paRow}`).setValue("On")
+    dash.getRange(`V${sRow}`).setValue("On")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg);
-    dash.getRange(`N${paRow}`).setValue("Time")
+    dash.getRange(`W${sRow}:X${sRow}`).merge().setValue("Time")
       .setFontWeight("bold").setFontSize(9).setFontColor(gray).setBackground(bg).setHorizontalAlignment("right");
-    dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-    paRow++;
+    dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+    sRow++;
 
     metaComments.slice(0, 8).forEach((c, cmIdx) => {
       const isMention = c.type === "mention";
       const rowBg = isMention ? amberLt : (cmIdx % 2 === 1 ? altRow : cardBg);
 
-      dash.setRowHeight(paRow, 20);
+      dash.setRowHeight(sRow, 20);
       // Author (hyperlinked to source)
       const safeAuthor = c.author.replace(/"/g, '""');
-      dash.getRange(`I${paRow}`)
+      dash.getRange(`Q${sRow}`)
         .setFormula(`=HYPERLINK("${c.url}","${safeAuthor}")`)
         .setFontSize(9).setFontColor("#1155CC").setBackground(rowBg);
       // Platform + type badge
       const platformShort = c.platform === "Instagram" ? "IG" : "FB";
       const platformColor = c.platform === "Instagram" ? "#C13584" : "#1877F2";
       const label = isMention ? platformShort + " tag" : platformShort;
-      dash.getRange(`J${paRow}`).setValue(label)
+      dash.getRange(`R${sRow}`).setValue(label)
         .setFontSize(8).setFontWeight("bold").setFontColor(platformColor).setBackground(rowBg);
-      dash.getRange(`K${paRow}:L${paRow}`).merge()
+      dash.getRange(`S${sRow}:U${sRow}`).merge()
         .setBackground(rowBg);
       // Post snippet in "On" column
-      dash.getRange(`M${paRow}`).setValue(c.postSnippet || "")
+      dash.getRange(`V${sRow}`).setValue(c.postSnippet || "")
         .setFontSize(8).setFontColor(gray).setBackground(rowBg)
         .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
 
@@ -2043,19 +2118,20 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
           timeDisplay = Utilities.formatDate(d, Session.getScriptTimeZone(), "MMM d h:mm a");
         } catch (e) { timeDisplay = ""; }
       }
-      dash.getRange(`N${paRow}`).setValue(timeDisplay)
+      dash.getRange(`W${sRow}:X${sRow}`).merge().setValue(timeDisplay)
         .setFontSize(8).setFontColor(gray).setBackground(rowBg).setHorizontalAlignment("right");
-      paRow++;
+      sRow++;
 
       // Row 2: comment text
-      dash.setRowHeight(paRow, 18);
-      dash.getRange(`I${paRow}:N${paRow}`).merge().setValue(c.text || "")
+      dash.setRowHeight(sRow, 18);
+      dash.getRange(`Q${sRow}:X${sRow}`).merge().setValue(c.text || "")
         .setFontSize(8).setFontColor(gray).setFontStyle("italic").setBackground(rowBg)
         .setWrapStrategy(SpreadsheetApp.WrapStrategy.CLIP);
-      dash.getRange(`I${paRow}:N${paRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
-      paRow++;
+      dash.getRange(`Q${sRow}:X${sRow}`).setBorder(false, false, true, false, false, false, divider, SpreadsheetApp.BorderStyle.SOLID);
+      sRow++;
     });
   }
+
 
   // ─── COLUMN WIDTHS ───
   dash.setColumnWidth(1, 60);   // A
@@ -2066,20 +2142,30 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   dash.setColumnWidth(6, 70);   // F
   dash.setColumnWidth(7, 75);   // G
   dash.setColumnWidth(8, 20);   // H spacer
-  dash.setColumnWidth(9, 115);  // I — Agent name / Customer
+  dash.setColumnWidth(9, 105);  // I — Agent name / Customer
   dash.setColumnWidth(10, 48);  // J — In / Via badge
   dash.setColumnWidth(11, 55);  // K — Dialed
   dash.setColumnWidth(12, 55);  // L — No Ans
   dash.setColumnWidth(13, 50);  // M — <90s
   dash.setColumnWidth(14, 50);  // N — 90s+
+  dash.setColumnWidth(15, 50);  // O — extra phone col
+  dash.setColumnWidth(16, 20);  // P spacer
+  dash.setColumnWidth(17, 110); // Q — Customer/Author
+  dash.setColumnWidth(18, 40);  // R — Via/Source badge
+  dash.setColumnWidth(19, 70);  // S — Message col 1
+  dash.setColumnWidth(20, 70);  // T — Message col 2
+  dash.setColumnWidth(21, 60);  // U — Message col 3
+  dash.setColumnWidth(22, 60);  // V — From/On
+  dash.setColumnWidth(23, 50);  // W — Time col 1
+  dash.setColumnWidth(24, 50);  // X — Time col 2
 
   // Fill remaining
-  const lastRow = Math.max(tRow, paRow) + 2;
-  dash.getRange(`A${lastRow}:N${lastRow + 4}`).setBackground(bg);
+  const lastRow = Math.max(tRow, paRow, sRow) + 2;
+  dash.getRange(`A${lastRow}:X${lastRow + 5}`).setBackground(bg);
 
   // Footer — version & goals
-  dash.getRange(`A${lastRow}:N${lastRow}`).merge()
-    .setValue(`CS Command Center v1.4.0  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon–Fri 6a–5p PST`)
+  dash.getRange(`A${lastRow}:X${lastRow}`).merge()
+    .setValue(`CS Command Center v1.5.0  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon–Fri 6a–5p PST`)
     .setFontColor(gray).setFontSize(8).setFontStyle("italic")
     .setHorizontalAlignment("center").setBackground(bg);
 
@@ -2087,31 +2173,40 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
   const legendRow = lastRow + 1;
   const legendLines = [
     `Email status: Healthy = 0 tickets past SLA, Watch = 1–5 past SLA, At Risk = 6+ past SLA  ·  `
-    + `Phone status: Healthy = answer rate ≥ ${CONFIG.thresholds.phoneAnswerRate.green}%, Watch = ${CONFIG.thresholds.phoneAnswerRate.yellow}–${CONFIG.thresholds.phoneAnswerRate.green - 1}%, At Risk = < ${CONFIG.thresholds.phoneAnswerRate.yellow}%`,
+    + `Phone status: Healthy = answer rate ≥ ${CONFIG.thresholds.phoneAnswerRate.green}%, Watch = ${CONFIG.thresholds.phoneAnswerRate.yellow}–${CONFIG.thresholds.phoneAnswerRate.green - 1}%, At Risk = < ${CONFIG.thresholds.phoneAnswerRate.yellow}%  ·  `
+    + `Social status: Healthy = oldest DM wait ≤ 2h, Watch = 2–6h, At Risk = > 6h`,
     `Wait times are business hours only (Mon–Fri 6a–5p PST)  ·  Past SLA = waiting > ${CONFIG.thresholds.oldestUnanswered.green} biz hrs without a reply  ·  `
     + `Oldest Waiting table: top 3 past SLA highlighted red, others past SLA amber, within SLA green`,
     `CSAT % = (satisfied ÷ total) × 100  ·  Satisfied = 4+ out of 5  ·  Phone answer rate = answered inbound ÷ total inbound (biz hrs only)  ·  `
     + `Open tickets exclude ${(CONFIG.excludeAgents || []).join(", ")} (not on CS team)`,
     `Social: FB = Facebook Messenger, IG = Instagram DM  ·  Comments & Mentions show last 24h from FB + IG posts  ·  `
     + `Amber highlight = unread DM or @mention  ·  Meta token expiry warning appears at 7 days`,
+    `API limitations: IG DMs not available (requires OAuth flow not supported by Graph API Explorer)  ·  `
+    + `Missed call customer info shows "Check Aircall #" when contact data is not exposed in the API payload`,
   ];
-  dash.getRange(`A${legendRow}:N${legendRow}`).merge()
-    .setValue(legendLines[0])
-    .setFontColor(gray).setFontSize(7).setFontStyle("italic")
-    .setHorizontalAlignment("center").setBackground(bg).setWrap(false);
-  dash.getRange(`A${legendRow + 1}:N${legendRow + 1}`).merge()
-    .setValue(legendLines[1])
-    .setFontColor(gray).setFontSize(7).setFontStyle("italic")
-    .setHorizontalAlignment("center").setBackground(bg).setWrap(false);
-  dash.getRange(`A${legendRow + 2}:N${legendRow + 2}`).merge()
-    .setValue(legendLines[2])
-    .setFontColor(gray).setFontSize(7).setFontStyle("italic")
-    .setHorizontalAlignment("center").setBackground(bg).setWrap(false);
-  dash.getRange(`A${legendRow + 3}:N${legendRow + 3}`).merge()
-    .setValue(legendLines[3])
-    .setFontColor(gray).setFontSize(7).setFontStyle("italic")
-    .setHorizontalAlignment("center").setBackground(bg).setWrap(false);
+  for (let li = 0; li < legendLines.length; li++) {
+    dash.getRange(`A${legendRow + li}:X${legendRow + li}`).merge()
+      .setValue(legendLines[li])
+      .setFontColor(gray).setFontSize(7).setFontStyle("italic")
+      .setHorizontalAlignment("center").setBackground(bg).setWrap(false);
+  }
 }
+
+// --- SOCIAL OLDEST WAIT HELPER ---
+function computeSocialOldestWait(meta) {
+  if (!meta || !meta.recentConversations) return 0;
+  const now = new Date();
+  let oldestMin = 0;
+  meta.recentConversations.forEach(c => {
+    if (c.unread > 0 && c.time) {
+      const msgTime = new Date(c.time);
+      const diffMin = (now - msgTime) / 60000;
+      if (diffMin > oldestMin) oldestMin = diffMin;
+    }
+  });
+  return Math.round(oldestMin);
+}
+
 
 // --- WRITE RAW DATA TABS ---
 function writeZendeskRaw(ss, data) {
@@ -3236,7 +3331,7 @@ function fetchMetaStatus() {
 
   // ─── Step 1: Messenger DMs ───
   const messengerData = graphGet(
-    `${pageId}/conversations?fields=id,updated_time,unread_count,participants,messages.limit(1){message,from,created_time}&limit=15`
+    `${pageId}/conversations?fields=id,updated_time,unread_count,participants,messages.limit(1){message,from,created_time}&limit=25`
   );
   const messengerConvos = parseConversations(messengerData, "Messenger");
 
@@ -3246,12 +3341,20 @@ function fetchMetaStatus() {
   );
   const igConvos = parseConversations(igDMData, "Instagram");
 
-  // Merge conversations, deduplicate by id, sort: unread first then newest
+  // Merge conversations, deduplicate by id, filter to actionable items only:
+  //   - Within last 24h (recent activity), OR
+  //   - Unread (unread_count > 0 per Meta API — the real "needs action" signal)
+  // Old conversations where the customer sent the last message months ago are NOT
+  // considered actionable — unread_count from the API is the authoritative indicator.
   const seenIds = new Set();
   const allConversations = [];
   [...messengerConvos, ...igConvos].forEach(c => {
-    if (!seenIds.has(c.id)) {
-      seenIds.add(c.id);
+    if (seenIds.has(c.id)) return;
+    seenIds.add(c.id);
+    const convoTime = c.time ? new Date(c.time) : new Date(0);
+    const isRecent = convoTime >= oneDayAgo;
+    const isUnread = c.unread > 0;
+    if (isRecent || isUnread) {
       allConversations.push(c);
     }
   });

@@ -10,6 +10,8 @@ Our CS tech stack is composed of a curated selection of purpose-built tools — 
 
 A single Google Apps Script file that pulls from all four APIs and renders a consolidated real-time command center inside Google Sheets. Refreshes every 5 minutes. Zero additional cost, no new tools to learn, no vendor to manage.
 
+![CS Command Center Dashboard](dashboard_screenshot.png)
+
 ### What it tracks
 
 **Email (Zendesk)**
@@ -43,6 +45,7 @@ A single Google Apps Script file that pulls from all four APIs and renders a con
 **Dashboard health indicators**
 - Email status: Healthy / Watch / At Risk (based on SLA breach count)
 - Phone status: Healthy / Watch / At Risk (based on answer rate)
+- Social status: Healthy / Watch / At Risk (based on oldest unread DM response time)
 - All thresholds configurable via Script Properties
 
 ## Tech stack
@@ -89,6 +92,8 @@ SLA thresholds default to sensible values but can be overridden per-deployment:
 | `SLA_FRT_YELLOW` | `24` | Median first reply time (biz hrs) — yellow ceiling |
 | `SLA_WAIT_GREEN` | `30` | Average wait time (min) — green ceiling |
 | `SLA_WAIT_YELLOW` | `60` | Average wait time (min) — yellow ceiling |
+| `SLA_SOCIAL_GREEN` | `120` | Social oldest unread DM (min) — green ceiling |
+| `SLA_SOCIAL_YELLOW` | `360` | Social oldest unread DM (min) — yellow ceiling |
 
 ### Meta Business Suite setup
 
@@ -122,7 +127,7 @@ All configuration is in the `CONFIG` object at the top of the script:
       ┌─────────▼──────────┐
       │  Google Apps Script  │
       │  (Code.gs — single   │
-      │   file, ~3500 LOC)   │
+      │   file, ~3600 LOC)   │
       └─────────┬──────────┘
                 │
       ┌─────────▼──────────┐
@@ -133,6 +138,13 @@ All configuration is in the `CONFIG` object at the top of the script:
 ```
 
 The script runs on a 5-minute trigger. Each refresh fetches fresh data from all four APIs, processes it, and overwrites the Dashboard sheet. A staging sheet is used during writes to prevent the dashboard from flickering mid-update. Raw data is also written to hidden tabs for debugging.
+
+The dashboard uses a three-column layout — Email (left), Phone (center), Social (right) — with independent health status indicators per channel and shared KPI cards at the top.
+
+## Known limitations
+
+- **Instagram DMs**: The Graph API endpoint for Instagram conversations requires the `instagram_business_manage_messages` permission, which is only available through the Instagram Login OAuth flow — not the Facebook Login flow used by Graph API Explorer tokens. As a result, IG DMs are not currently fetched. Messenger DMs, IG post comments, and IG mentions all work as expected.
+- **Missed call customer info**: Aircall's API does not expose contact details for certain missed call scenarios. The dashboard shows "Check Aircall #[call ID]" with a link to the call record instead.
 
 ## Security
 
