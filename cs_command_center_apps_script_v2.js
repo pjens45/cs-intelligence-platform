@@ -245,6 +245,17 @@ function getHiddenIGSenders(ssOverride) {
 
 // --- MAIN REFRESH FUNCTION ---
 function refreshDashboard() {
+  // Skip refresh outside business hours to conserve Apps Script execution quota
+  const bh = CONFIG.businessHours;
+  const nowCheck = new Date();
+  const pacificStr = nowCheck.toLocaleString("en-US", { timeZone: bh.timezone });
+  const pacificNow = new Date(pacificStr);
+  const dow = pacificNow.getDay();
+  const hour = pacificNow.getHours();
+  if (!bh.workDays.includes(dow) || hour < bh.startHour || hour >= bh.endHour) {
+    return;  // outside Mon–Fri 6am–5pm Pacific — skip silently
+  }
+
   loadThresholds();  // read SLA targets from Script Properties (falls back to defaults)
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const runLog = getOrCreateSheet(ss, "Run Log");
@@ -310,6 +321,13 @@ function fetchZendeskStatus() {
     tickets = tickets.concat(searchData.results || []);
     hasMore = searchData.next_page;
     searchPage++;
+  }
+
+  // Filter out AI agent tickets (bot-only conversations that can't be edited)
+  const aiAgentCount = tickets.filter(t => t.support_type === "ai_agent").length;
+  tickets = tickets.filter(t => t.support_type !== "ai_agent");
+  if (aiAgentCount > 0) {
+    Logger.log("Excluded " + aiAgentCount + " AI agent tickets from dashboard");
   }
 
   // Step 2: Resolve user IDs to names/emails
@@ -520,6 +538,7 @@ function fetchZendeskStatus() {
     openQueueCount,
     onHoldQueueCount,
     openVoicemails,
+    aiAgentCount,
     agentCounts,
     tickets: filtered,
     flaggedTickets,
@@ -2368,7 +2387,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
 
   // Footer — version & goals
   dash.getRange(`A${lastRow}:X${lastRow}`).merge()
-    .setValue(`CS Command Center v1.7.0  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon–Fri 6a–5p PST`)
+    .setValue(`CS Command Center v1.8.1  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon–Fri 6a–5p PST`)
     .setFontColor(gray).setFontSize(8).setFontStyle("italic")
     .setHorizontalAlignment("center").setBackground(bg);
 
@@ -2385,7 +2404,8 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
     `Social: FB = Facebook Messenger, IG = Instagram DM  ·  Comments & Mentions show last 24h from FB + IG posts  ·  `
     + `Amber highlight = unread DM or @mention  ·  Meta token expiry warning appears at 7 days`,
     `API notes: IG DMs powered by Meta webhooks → IG DM Log sheet  ·  `
-    + `Missed call customer info shows "Check Aircall #" when contact data is not exposed in the API payload`,
+    + `Missed call customer info shows "Check Aircall #" when contact data is not exposed in the API payload  ·  `
+    + `${zendesk.aiAgentCount > 0 ? zendesk.aiAgentCount + " AI agent ticket(s) excluded (auto-close after 4 days idle)" : "AI agent bot tickets excluded from all counts"}`,
   ];
   for (let li = 0; li < legendLines.length; li++) {
     dash.getRange(`A${legendRow + li}:X${legendRow + li}`).merge()
@@ -4154,7 +4174,7 @@ function sendDailyRecap() {
           <tr><td style="${colLabel}padding:4px 0;">Unassigned</td><td style="${colToday}font-weight:bold;">${zendesk.unassigned}</td>${prevTd(prev.unassigned)}</tr>
           <tr><td style="${colLabel}padding:4px 0;">SAS Tickets</td><td style="${colToday}font-weight:bold;">${sasCount}</td>${prevTd(prev.sasTickets)}</tr>
           <tr><td style="${colLabel}padding:4px 0;">Voicemails (Open)</td><td style="${colToday}font-weight:bold;">${zendesk.openVoicemails || 0}</td>${prevTd(prev.openVoicemails)}</tr>
-          <tr><td style="${colLabel}padding:4px 0;">Past SLA (${zendesk.slaHours}h)</td><td style="${colToday}font-weight:bold;color:${zendesk.totalBreached > 0 ? '#C62828' : '#2E7D32'};">${zendesk.totalBreached}</td>${prevTd(prev.pastSla)}</tr>
+          <tr><td style="${colLabel}padding:4px 0;">Past SLA (${zendesk.slaHours}h)</td><td style="${colToday}font-weight:bold;color:${healthColors[emailHealth]};">${zendesk.totalBreached}</td>${prevTd(prev.pastSla)}</tr>
           <tr><td style="${colLabel}padding:4px 0;">Solved Today</td><td style="${colToday}font-weight:bold;">${zendesk.totalHandledToday}</td>${hasPrev ? `<td style="${colYest}"></td>` : ''}</tr>
         </table>`;
 
@@ -4180,7 +4200,7 @@ function sendDailyRecap() {
         <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Phone (Aircall)</h2>
         <table style="width:100%;font-size:13px;border-collapse:collapse;">
           ${compHeader}
-          <tr><td style="${colLabel}padding:4px 0;">Answer Rate</td><td style="${colToday}font-weight:bold;color:${answerRateRounded >= 75 ? '#2E7D32' : '#C62828'};">${answerRateRounded}%</td>${prevTd(prev.answerRate, "%")}</tr>
+          <tr><td style="${colLabel}padding:4px 0;">Answer Rate</td><td style="${colToday}font-weight:bold;color:${healthColors[phoneHealth]};">${answerRateRounded}%</td>${prevTd(prev.answerRate, "%")}</tr>
           <tr><td style="${colLabel}padding:4px 0;">Inbound (Team Answered)</td><td style="${colToday}font-weight:bold;">${aircall.teamAnswered}</td>${hasPrev ? `<td style="${colYest}"></td>` : ''}</tr>
           <tr><td style="${colLabel}padding:4px 0;">Forwarded to SAS</td><td style="${colToday}font-weight:bold;">${aircall.forwarded}</td>${hasPrev ? `<td style="${colYest}"></td>` : ''}</tr>
           <tr><td style="${colLabel}padding:4px 0;">Outbound Calls</td><td style="${colToday}font-weight:bold;">${aircall.totalOutbound}</td>${hasPrev ? `<td style="${colYest}"></td>` : ''}</tr>
@@ -4224,7 +4244,7 @@ function sendDailyRecap() {
         <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Social (Meta Business Suite)</h2>
         <table style="width:100%;font-size:13px;border-collapse:collapse;">
           ${compHeader}
-          <tr><td style="${colLabel}padding:4px 0;">Unread DMs</td><td style="${colToday}font-weight:bold;color:${metaUnread > 0 ? '#C62828' : '#2E7D32'};">${metaUnread}</td>${prevTd(prev.unreadDMs)}</tr>
+          <tr><td style="${colLabel}padding:4px 0;">Unread DMs</td><td style="${colToday}font-weight:bold;color:${healthColors[socialHealth]};">${metaUnread}</td>${prevTd(prev.unreadDMs)}</tr>
           <tr><td style="${colLabel}padding:4px 0;">Active Conversations (24h)</td><td style="${colToday}font-weight:bold;">${metaConvos.length}</td>${hasPrev ? `<td style="${colYest}"></td>` : ''}</tr>
           <tr><td style="${colLabel}padding:4px 0;">Comments & Mentions (24h)</td><td style="${colToday}font-weight:bold;">${metaComments.length}</td>${hasPrev ? `<td style="${colYest}"></td>` : ''}</tr>
         </table>`;
@@ -4277,7 +4297,7 @@ function sendDailyRecap() {
         <div style="margin-bottom:4px;">The "Yesterday" column shows the previous working day's end-of-day values for comparison.</div>
       </div>
       <div style="text-align:center;padding:8px 0;font-size:11px;color:#999;">
-        CS Command Center v1.7.0 · End of Day Summary · ${dateStr}
+        CS Command Center v1.8.1 · End of Day Summary · ${dateStr}
       </div>
     </div>
   </div>`;
@@ -4306,9 +4326,949 @@ function sendDailyRecap() {
   };
   props.setProperty("RECAP_PREV_SNAPSHOT", JSON.stringify(snapshot));
   Logger.log("Saved daily snapshot for comparison: " + JSON.stringify(snapshot));
+
+  // ── Append to Daily Metrics Log sheet (powers weekly/monthly summaries) ──
+  logDailyMetrics({
+    date: Utilities.formatDate(now, tz, "yyyy-MM-dd"),
+    dayOfWeek: Utilities.formatDate(now, tz, "EEEE"),
+    openTickets: zendesk.totalOpen,
+    unassigned: zendesk.unassigned,
+    onHold: zendesk.onHoldQueueCount,
+    pastSla: zendesk.totalBreached,
+    sasTickets: sasCount,
+    openVoicemails: zendesk.openVoicemails || 0,
+    aiAgentTickets: zendesk.aiAgentCount || 0,
+    solvedTotal: zendesk.totalHandledToday || 0,
+    agentSolved: CONFIG.agents.map(a => (zendesk.agentCounts[a] || {}).handledToday || 0),
+    answerRate: answerRateRounded,
+    inboundCalls: aircall.teamAnswered || 0,
+    forwardedToSAS: aircall.forwarded || 0,
+    outboundCalls: aircall.totalOutbound || 0,
+    avgWaitTime: Math.round(aircall.avgWaitTime || 0),
+    avgCallDuration: Math.round(aircall.avgDuration || 0),
+    agentInbound: CONFIG.agents.map(a => (aircall.agentStats[a] || {}).answered || 0),
+    agentOutbound: CONFIG.agents.map(a => (aircall.agentStats[a] || {}).outbound || 0),
+    csatPct: csat.score,
+    csatResponses: csat.total || 0,
+    csatSatisfied: csat.satisfied || 0,
+    phoneCsatPct: postCall.score,
+    phoneCsatResponses: postCall.total || 0,
+    unreadDMs: metaUnread,
+    smsInbound: sms.inbound || 0,
+    smsOutbound: sms.outbound || 0,
+  });
 }
 
-// Set up the daily recap trigger (run once from Apps Script editor)
+// ─── DAILY METRICS LOG ───
+// Appends one row per working day to a "Daily Metrics Log" sheet.
+// Powers weekly/monthly summary emails and Hex historical dashboard.
+// Column order must match METRICS_LOG_HEADERS exactly.
+
+const METRICS_LOG_HEADERS = [
+  "Date", "Day", "Open Tickets", "Unassigned", "On Hold", "Past SLA",
+  "SAS Tickets", "Open Voicemails", "AI Agent Tickets",
+  "Solved Total",
+  // Per-agent solved columns are dynamically named from CONFIG.agents
+  // e.g. "Solved: AgentA", "Solved: AgentB", "Solved: AgentC"
+  ...CONFIG.agents.map(a => "Solved: " + a.split(" ")[0]),
+  "Answer Rate %", "Inbound Calls", "Forwarded to SAS", "Outbound Calls",
+  "Avg Wait (sec)", "Avg Duration (sec)",
+  // Per-agent inbound/outbound
+  ...CONFIG.agents.map(a => "In: " + a.split(" ")[0]),
+  ...CONFIG.agents.map(a => "Out: " + a.split(" ")[0]),
+  "Email CSAT %", "Email CSAT Responses", "Email CSAT Satisfied",
+  "Phone CSAT %", "Phone CSAT Responses",
+  "Unread DMs", "SMS Inbound", "SMS Outbound",
+];
+
+function getOrCreateMetricsLog() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Daily Metrics Log");
+  if (!sheet) {
+    sheet = ss.insertSheet("Daily Metrics Log");
+    // Write header row
+    sheet.getRange(1, 1, 1, METRICS_LOG_HEADERS.length).setValues([METRICS_LOG_HEADERS]);
+    sheet.getRange(1, 1, 1, METRICS_LOG_HEADERS.length)
+      .setFontWeight("bold").setFontSize(9).setBackground("#E1DFDD");
+    sheet.setFrozenRows(1);
+    // Set date column format
+    sheet.getRange("A:A").setNumberFormat("yyyy-mm-dd");
+    Logger.log("Created 'Daily Metrics Log' sheet with " + METRICS_LOG_HEADERS.length + " columns");
+  }
+  return sheet;
+}
+
+function logDailyMetrics(m) {
+  const sheet = getOrCreateMetricsLog();
+
+  // Prevent duplicate rows for the same date
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    const lastDate = sheet.getRange(lastRow, 1).getValue();
+    if (lastDate) {
+      const lastDateStr = (lastDate instanceof Date)
+        ? Utilities.formatDate(lastDate, CONFIG.businessHours.timezone, "yyyy-MM-dd")
+        : String(lastDate);
+      if (lastDateStr === m.date) {
+        Logger.log("Daily Metrics Log already has entry for " + m.date + " — skipping");
+        return;
+      }
+    }
+  }
+
+  // Build row in exact column order matching METRICS_LOG_HEADERS
+  const row = [
+    m.date,
+    m.dayOfWeek,
+    m.openTickets,
+    m.unassigned,
+    m.onHold,
+    m.pastSla,
+    m.sasTickets,
+    m.openVoicemails,
+    m.aiAgentTickets,
+    m.solvedTotal,
+    ...m.agentSolved,          // per-agent solved (matches CONFIG.agents order)
+    m.answerRate,
+    m.inboundCalls,
+    m.forwardedToSAS,
+    m.outboundCalls,
+    m.avgWaitTime,
+    m.avgCallDuration,
+    ...m.agentInbound,         // per-agent inbound calls
+    ...m.agentOutbound,        // per-agent outbound calls
+    m.csatPct !== null && m.csatPct !== undefined ? m.csatPct : "",
+    m.csatResponses,
+    m.csatSatisfied,
+    m.phoneCsatPct !== null && m.phoneCsatPct !== undefined ? m.phoneCsatPct : "",
+    m.phoneCsatResponses,
+    m.unreadDMs,
+    m.smsInbound,
+    m.smsOutbound,
+  ];
+
+  sheet.appendRow(row);
+  Logger.log("Logged daily metrics for " + m.date + " (" + row.length + " columns)");
+}
+
+// Read metrics log data for a date range (inclusive).
+// Returns array of objects keyed by header name.
+function readMetricsLog(startDate, endDate) {
+  const sheet = getOrCreateMetricsLog();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];  // header only
+
+  const data = sheet.getRange(1, 1, lastRow, METRICS_LOG_HEADERS.length).getValues();
+  const headers = data[0];
+  const tz = CONFIG.businessHours.timezone;
+  const rows = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const dateVal = data[i][0];
+    if (!dateVal) continue;
+    const dateStr = (dateVal instanceof Date)
+      ? Utilities.formatDate(dateVal, tz, "yyyy-MM-dd")
+      : String(dateVal);
+    if (dateStr >= startDate && dateStr <= endDate) {
+      const obj = {};
+      headers.forEach((h, j) => { obj[h] = data[i][j]; });
+      obj._dateStr = dateStr;
+      rows.push(obj);
+    }
+  }
+  return rows;
+}
+
+// ─── WEEKLY & MONTHLY SUMMARY HELPERS ───
+
+// Compute aggregate metrics from an array of daily log rows.
+// Returns object with averages and totals.
+function aggregateMetrics(rows) {
+  if (rows.length === 0) return null;
+  const n = rows.length;
+
+  function avg(key) {
+    const vals = rows.map(r => Number(r[key]) || 0);
+    return vals.reduce((a, b) => a + b, 0) / n;
+  }
+  function sum(key) {
+    return rows.map(r => Number(r[key]) || 0).reduce((a, b) => a + b, 0);
+  }
+  function avgNonEmpty(key) {
+    const vals = rows.map(r => r[key]).filter(v => v !== "" && v !== null && v !== undefined).map(Number);
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  }
+
+  return {
+    days: n,
+    avgOpenTickets: Math.round(avg("Open Tickets") * 10) / 10,
+    avgUnassigned: Math.round(avg("Unassigned") * 10) / 10,
+    avgOnHold: Math.round(avg("On Hold") * 10) / 10,
+    avgPastSla: Math.round(avg("Past SLA") * 10) / 10,
+    avgVoicemails: Math.round(avg("Open Voicemails") * 10) / 10,
+    totalSolved: sum("Solved Total"),
+    agentSolved: CONFIG.agents.map(a => ({
+      name: a,
+      total: sum("Solved: " + a.split(" ")[0]),
+    })),
+    avgAnswerRate: Math.round(avg("Answer Rate %")),
+    totalInbound: sum("Inbound Calls"),
+    totalForwarded: sum("Forwarded to SAS"),
+    totalOutbound: sum("Outbound Calls"),
+    avgWaitTime: Math.round(avg("Avg Wait (sec)")),
+    agentInbound: CONFIG.agents.map(a => ({
+      name: a,
+      total: sum("In: " + a.split(" ")[0]),
+    })),
+    agentOutbound: CONFIG.agents.map(a => ({
+      name: a,
+      total: sum("Out: " + a.split(" ")[0]),
+    })),
+    avgCsatPct: avgNonEmpty("Email CSAT %"),
+    totalCsatResponses: sum("Email CSAT Responses"),
+    totalCsatSatisfied: sum("Email CSAT Satisfied"),
+    avgPhoneCsatPct: avgNonEmpty("Phone CSAT %"),
+    totalPhoneCsatResponses: sum("Phone CSAT Responses"),
+    avgUnreadDMs: Math.round(avg("Unread DMs") * 10) / 10,
+    totalSmsInbound: sum("SMS Inbound"),
+    totalSmsOutbound: sum("SMS Outbound"),
+  };
+}
+
+// Format a comparison cell: "78%" with optional delta "(was 72%)"
+function fmtComp(current, prior, unit, opts) {
+  const u = unit || "";
+  const round = (opts && opts.round !== undefined) ? opts.round : 0;
+  const curStr = current !== null && current !== undefined
+    ? (round > 0 ? Number(current).toFixed(round) : Math.round(current)) + u
+    : "—";
+  if (prior === null || prior === undefined) return curStr;
+  const priorStr = (round > 0 ? Number(prior).toFixed(round) : Math.round(prior)) + u;
+  return `${curStr} <span style="color:#888;font-size:11px;">(was ${priorStr})</span>`;
+}
+
+// Get date range for the current work-week (Mon–Fri of this week)
+function getThisWeekRange(now, tz) {
+  const d = new Date(Utilities.formatDate(now, tz, "yyyy-MM-dd") + "T12:00:00");
+  const dow = d.getDay(); // 0=Sun ... 6=Sat
+  // Monday of this week
+  const mondayOffset = dow === 0 ? -6 : 1 - dow;
+  const monday = new Date(d);
+  monday.setDate(d.getDate() + mondayOffset);
+  const friday = new Date(monday);
+  friday.setDate(monday.getDate() + 4);
+  return {
+    start: Utilities.formatDate(monday, tz, "yyyy-MM-dd"),
+    end: Utilities.formatDate(friday, tz, "yyyy-MM-dd"),
+  };
+}
+
+// Get date range for the prior work-week
+function getLastWeekRange(now, tz) {
+  const d = new Date(Utilities.formatDate(now, tz, "yyyy-MM-dd") + "T12:00:00");
+  const dow = d.getDay();
+  const mondayOffset = dow === 0 ? -6 : 1 - dow;
+  const thisMonday = new Date(d);
+  thisMonday.setDate(d.getDate() + mondayOffset);
+  const lastFriday = new Date(thisMonday);
+  lastFriday.setDate(thisMonday.getDate() - 3);
+  const lastMonday = new Date(lastFriday);
+  lastMonday.setDate(lastFriday.getDate() - 4);
+  return {
+    start: Utilities.formatDate(lastMonday, tz, "yyyy-MM-dd"),
+    end: Utilities.formatDate(lastFriday, tz, "yyyy-MM-dd"),
+  };
+}
+
+// Get date range for a full calendar month (1st–last day)
+function getMonthRange(year, month, tz) {
+  const start = `${year}-${String(month).padStart(2, "0")}-01`;
+  const lastDay = new Date(year, month, 0).getDate(); // day 0 of next month = last day of this month
+  const end = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+  return { start, end };
+}
+
+// Check if today is the last working day of the week (usually Friday, Thursday if Fri is holiday)
+function isLastWorkingDayOfWeek(now, holidays) {
+  const tz = CONFIG.businessHours.timezone;
+  const dow = new Date(Utilities.formatDate(now, tz, "yyyy-MM-dd") + "T12:00:00").getDay();
+  // Must be a working day itself
+  if (!CONFIG.businessHours.workDays.includes(dow)) return false;
+  // Check if tomorrow through Sunday are all non-working days
+  for (let i = 1; i <= (7 - dow); i++) {
+    const next = new Date(now);
+    next.setDate(now.getDate() + i);
+    const nextDow = new Date(Utilities.formatDate(next, tz, "yyyy-MM-dd") + "T12:00:00").getDay();
+    if (nextDow === 0 || nextDow === 6) continue; // weekend
+    const nextKey = Utilities.formatDate(next, tz, "yyyy-MM-dd");
+    if (holidays.has(nextKey)) continue; // holiday
+    return false; // found a working day before end of week
+  }
+  return true;
+}
+
+// Check if today is the last business day of the month
+function isLastBusinessDayOfMonth(now, holidays) {
+  const tz = CONFIG.businessHours.timezone;
+  const todayStr = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+  const todayDate = new Date(todayStr + "T12:00:00");
+  const thisMonth = todayDate.getMonth();
+  // Must be a working day
+  const dow = todayDate.getDay();
+  if (!CONFIG.businessHours.workDays.includes(dow)) return false;
+  if (holidays.has(todayStr)) return false;
+  // Check remaining days of the month
+  for (let d = 1; d <= 10; d++) {
+    const next = new Date(todayDate);
+    next.setDate(todayDate.getDate() + d);
+    if (next.getMonth() !== thisMonth) break; // past end of month
+    const nextDow = next.getDay();
+    if (nextDow === 0 || nextDow === 6) continue;
+    const nextKey = Utilities.formatDate(next, tz, "yyyy-MM-dd");
+    if (holidays.has(nextKey)) continue;
+    return false; // found a later business day in this month
+  }
+  return true;
+}
+
+// ─── WEEKLY SUMMARY EMAIL ───
+// Triggered daily at 6:15pm — only sends on the last working day of the week.
+function checkAndSendWeeklySummary() {
+  loadThresholds();
+  const tz = CONFIG.businessHours.timezone;
+  const now = new Date();
+  const holidays = getDeakoHolidays();
+
+  if (!isLastWorkingDayOfWeek(now, holidays)) {
+    Logger.log("Not the last working day of the week — skipping weekly summary");
+    return;
+  }
+
+  sendWeeklySummary(now, tz);
+}
+
+function sendWeeklySummary(now, tz) {
+  const props = PropertiesService.getScriptProperties();
+  const recipients = props.getProperty("RECAP_RECIPIENTS") || "";
+  if (!recipients) { Logger.log("RECAP_RECIPIENTS not set — skipping weekly summary"); return; }
+
+  const thisWeek = getThisWeekRange(now, tz);
+  const lastWeek = getLastWeekRange(now, tz);
+
+  const thisData = readMetricsLog(thisWeek.start, thisWeek.end);
+  const lastData = readMetricsLog(lastWeek.start, lastWeek.end);
+
+  const curr = aggregateMetrics(thisData);
+  const prev = aggregateMetrics(lastData);
+
+  if (!curr || curr.days === 0) {
+    Logger.log("No metrics data for this week — skipping weekly summary");
+    return;
+  }
+
+  const navy = "#1B3747";
+  const cardBg = "#F8F7F6";
+  const borderColor = "#E1DFDD";
+  const weekLabel = `${formatDateShort(thisWeek.start, tz)} – ${formatDateShort(thisWeek.end, tz)}`;
+  const prevWeekLabel = prev ? `${formatDateShort(lastWeek.start, tz)} – ${formatDateShort(lastWeek.end, tz)}` : "";
+  const noData = '<span style="color:#AAA;">no prior data</span>';
+
+  const colLabel = "width:50%;padding:4px 0;";
+  const colThis = "width:25%;text-align:right;padding:4px 0;";
+  const colPrev = "width:25%;text-align:right;padding:4px 0;color:#888;font-size:12px;";
+
+  function prevCell(currVal, prevVal, unit, opts) {
+    if (!prev) return `<td style="${colPrev}">${noData}</td>`;
+    return `<td style="${colPrev}">${fmtComp(prevVal, null, unit, opts)}</td>`;
+  }
+
+  let html = `
+  <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;color:#1D1D1D;">
+    <div style="background:${navy};color:#fff;padding:16px 24px;border-radius:8px 8px 0 0;">
+      <h1 style="margin:0;font-size:20px;">CS Command Center — Weekly Summary</h1>
+      <p style="margin:4px 0 0;font-size:13px;color:#C3D3D7;">${weekLabel} (${curr.days} working days)</p>
+    </div>
+    <div style="padding:20px 24px;">`;
+
+  // Table header row
+  const headerRow = `<tr style="border-bottom:1px solid ${borderColor};">
+    <td style="${colLabel}"></td>
+    <td style="${colThis}font-size:11px;color:#888;font-weight:bold;">This Week</td>
+    <td style="${colPrev}font-size:11px;font-weight:bold;">${prev ? "Last Week" : ""}</td></tr>`;
+
+  // ── EMAIL / ZENDESK SECTION ──
+  html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+    <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Email (Zendesk)</h2>
+    <table style="width:100%;font-size:13px;border-collapse:collapse;">
+      ${headerRow}
+      <tr><td style="${colLabel}">Avg Open Tickets</td><td style="${colThis}font-weight:bold;">${curr.avgOpenTickets}</td>${prevCell(curr.avgOpenTickets, prev ? prev.avgOpenTickets : null, "")}</tr>
+      <tr><td style="${colLabel}">Avg Past SLA</td><td style="${colThis}font-weight:bold;color:${curr.avgPastSla > 0 ? '#C62828' : '#2E7D32'};">${curr.avgPastSla}</td>${prevCell(curr.avgPastSla, prev ? prev.avgPastSla : null, "")}</tr>
+      <tr><td style="${colLabel}">Avg Unassigned</td><td style="${colThis}font-weight:bold;">${curr.avgUnassigned}</td>${prevCell(curr.avgUnassigned, prev ? prev.avgUnassigned : null, "")}</tr>
+      <tr><td style="${colLabel}">Tickets Solved</td><td style="${colThis}font-weight:bold;">${curr.totalSolved}</td>${prevCell(curr.totalSolved, prev ? prev.totalSolved : null, "")}</tr>
+    </table>`;
+
+  // Per-agent solved
+  html += `<div style="margin-top:12px;font-size:12px;color:#666;font-weight:bold;">Per Agent — Solved</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:4px;">
+      <tr style="color:#888;"><td style="${colLabel}">Agent</td><td style="${colThis}">This Week</td><td style="${colPrev}">${prev ? "Last Week" : ""}</td></tr>`;
+  curr.agentSolved.forEach((a, i) => {
+    const prevVal = prev ? prev.agentSolved[i].total : null;
+    html += `<tr><td style="${colLabel}">${a.name.split(" ")[0]}</td><td style="${colThis}">${a.total}</td><td style="${colPrev}">${prevVal !== null ? prevVal : noData}</td></tr>`;
+  });
+  html += `</table></div>`;
+
+  // ── PHONE SECTION ──
+  html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+    <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Phone (Aircall)</h2>
+    <table style="width:100%;font-size:13px;border-collapse:collapse;">
+      ${headerRow}
+      <tr><td style="${colLabel}">Avg Answer Rate</td><td style="${colThis}font-weight:bold;color:${curr.avgAnswerRate >= 75 ? '#2E7D32' : '#C62828'};">${curr.avgAnswerRate}%</td>${prevCell(curr.avgAnswerRate, prev ? prev.avgAnswerRate : null, "%")}</tr>
+      <tr><td style="${colLabel}">Total Inbound</td><td style="${colThis}font-weight:bold;">${curr.totalInbound}</td>${prevCell(curr.totalInbound, prev ? prev.totalInbound : null, "")}</tr>
+      <tr><td style="${colLabel}">Forwarded to SAS</td><td style="${colThis}font-weight:bold;">${curr.totalForwarded}</td>${prevCell(curr.totalForwarded, prev ? prev.totalForwarded : null, "")}</tr>
+      <tr><td style="${colLabel}">Total Outbound</td><td style="${colThis}font-weight:bold;">${curr.totalOutbound}</td>${prevCell(curr.totalOutbound, prev ? prev.totalOutbound : null, "")}</tr>
+      <tr><td style="${colLabel}">Avg Wait Time</td><td style="${colThis}font-weight:bold;">${curr.avgWaitTime}s</td>${prevCell(curr.avgWaitTime, prev ? prev.avgWaitTime : null, "s")}</tr>
+    </table>`;
+
+  // Per-agent inbound/outbound
+  html += `<div style="margin-top:12px;font-size:12px;color:#666;font-weight:bold;">Per Agent — Calls</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:4px;">
+      <tr style="color:#888;"><td style="width:34%;">Agent</td><td style="width:16%;text-align:right;">In</td><td style="width:16%;text-align:right;">Out</td><td style="width:17%;text-align:right;font-size:11px;">${prev ? "Prev In" : ""}</td><td style="width:17%;text-align:right;font-size:11px;">${prev ? "Prev Out" : ""}</td></tr>`;
+  curr.agentInbound.forEach((a, i) => {
+    const outTotal = curr.agentOutbound[i].total;
+    const prevIn = prev ? prev.agentInbound[i].total : null;
+    const prevOut = prev ? prev.agentOutbound[i].total : null;
+    if (a.total > 0 || outTotal > 0) {
+      html += `<tr><td style="width:34%;padding:2px 0;">${a.name.split(" ")[0]}</td><td style="width:16%;text-align:right;">${a.total}</td><td style="width:16%;text-align:right;">${outTotal}</td>`;
+      html += `<td style="width:17%;text-align:right;color:#888;font-size:11px;">${prevIn !== null ? prevIn : ""}</td>`;
+      html += `<td style="width:17%;text-align:right;color:#888;font-size:11px;">${prevOut !== null ? prevOut : ""}</td></tr>`;
+    }
+  });
+  html += `</table></div>`;
+
+  // ── CSAT SECTION ──
+  if (curr.totalCsatResponses > 0 || curr.totalPhoneCsatResponses > 0) {
+    html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+      <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Customer Satisfaction</h2>
+      <table style="width:100%;font-size:13px;border-collapse:collapse;">
+        ${headerRow}`;
+    if (curr.avgCsatPct !== null) {
+      html += `<tr><td style="${colLabel}">Email CSAT</td><td style="${colThis}font-weight:bold;">${Math.round(curr.avgCsatPct)}% (${curr.totalCsatResponses} reviews)</td>${prevCell(null, prev && prev.avgCsatPct !== null ? Math.round(prev.avgCsatPct) + "% (" + prev.totalCsatResponses + ")" : null, "")}</tr>`;
+    }
+    if (curr.avgPhoneCsatPct !== null) {
+      html += `<tr><td style="${colLabel}">Phone CSAT</td><td style="${colThis}font-weight:bold;">${Math.round(curr.avgPhoneCsatPct)}% (${curr.totalPhoneCsatResponses} reviews)</td>${prevCell(null, prev && prev.avgPhoneCsatPct !== null ? Math.round(prev.avgPhoneCsatPct) + "% (" + prev.totalPhoneCsatResponses + ")" : null, "")}</tr>`;
+    }
+    html += `</table></div>`;
+  }
+
+  // ── SOCIAL SECTION ──
+  html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+    <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Social (Meta Business Suite)</h2>
+    <table style="width:100%;font-size:13px;border-collapse:collapse;">
+      ${headerRow}
+      <tr><td style="${colLabel}">Avg Unread DMs at EOD</td><td style="${colThis}font-weight:bold;">${curr.avgUnreadDMs}</td>${prevCell(curr.avgUnreadDMs, prev ? prev.avgUnreadDMs : null, "")}</tr>
+      <tr><td style="${colLabel}">Total SMS In/Out</td><td style="${colThis}font-weight:bold;">${curr.totalSmsInbound} / ${curr.totalSmsOutbound}</td>${prev ? `<td style="${colPrev}">${prev.totalSmsInbound} / ${prev.totalSmsOutbound}</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>
+    </table></div>`;
+
+  // Footer
+  html += `<div style="text-align:center;font-size:11px;color:#999;padding-top:8px;">
+      CS Command Center v1.8.1 · Weekly Summary · ${weekLabel}
+      ${prev ? '<br>Comparison: ' + prevWeekLabel : '<br>No prior week data available for comparison'}
+    </div>
+    </div>
+  </div>`;
+
+  const subject = `CS Weekly Summary — ${weekLabel} — Solved: ${curr.totalSolved} · Avg Open: ${curr.avgOpenTickets} · Answer Rate: ${curr.avgAnswerRate}%`;
+
+  GmailApp.sendEmail(recipients, subject, "View this email with HTML enabled.", {
+    htmlBody: html,
+    name: "CS Command Center",
+  });
+
+  Logger.log("Weekly summary sent to: " + recipients);
+}
+
+// ─── MONTHLY SUMMARY EMAIL ───
+// Triggered daily at 6:30pm — only sends on the last business day of the month.
+function checkAndSendMonthlySummary() {
+  loadThresholds();
+  const tz = CONFIG.businessHours.timezone;
+  const now = new Date();
+  const holidays = getDeakoHolidays();
+
+  if (!isLastBusinessDayOfMonth(now, holidays)) {
+    Logger.log("Not the last business day of the month — skipping monthly summary");
+    return;
+  }
+
+  sendMonthlySummary(now, tz);
+}
+
+function sendMonthlySummary(now, tz) {
+  const props = PropertiesService.getScriptProperties();
+  const recipients = props.getProperty("RECAP_RECIPIENTS") || "";
+  if (!recipients) { Logger.log("RECAP_RECIPIENTS not set — skipping monthly summary"); return; }
+
+  const todayDate = new Date(Utilities.formatDate(now, tz, "yyyy-MM-dd") + "T12:00:00");
+  const thisMonth = todayDate.getMonth() + 1; // 1-indexed
+  const thisYear = todayDate.getFullYear();
+  const lastMonth = thisMonth === 1 ? 12 : thisMonth - 1;
+  const lastYear = thisMonth === 1 ? thisYear - 1 : thisYear;
+
+  const thisRange = getMonthRange(thisYear, thisMonth, tz);
+  const lastRange = getMonthRange(lastYear, lastMonth, tz);
+
+  const thisData = readMetricsLog(thisRange.start, thisRange.end);
+  const lastData = readMetricsLog(lastRange.start, lastRange.end);
+
+  const curr = aggregateMetrics(thisData);
+  const prev = aggregateMetrics(lastData);
+
+  if (!curr || curr.days === 0) {
+    Logger.log("No metrics data for this month — skipping monthly summary");
+    return;
+  }
+
+  const navy = "#1B3747";
+  const cardBg = "#F8F7F6";
+  const borderColor = "#E1DFDD";
+  const monthNames = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+  const monthLabel = monthNames[thisMonth - 1] + " " + thisYear;
+  const prevMonthLabel = prev ? monthNames[lastMonth - 1] + " " + lastYear : "";
+  const noData = '<span style="color:#AAA;">no prior data</span>';
+
+  const colLabel = "width:50%;padding:4px 0;";
+  const colThis = "width:25%;text-align:right;padding:4px 0;";
+  const colPrev = "width:25%;text-align:right;padding:4px 0;color:#888;font-size:12px;";
+
+  function prevCell(currVal, prevVal, unit) {
+    if (!prev) return `<td style="${colPrev}">${noData}</td>`;
+    return `<td style="${colPrev}">${prevVal !== null && prevVal !== undefined ? (typeof prevVal === 'number' ? Math.round(prevVal * 10) / 10 : prevVal) + (unit || "") : "—"}</td>`;
+  }
+
+  // Table header row
+  const headerRow = `<tr style="border-bottom:1px solid ${borderColor};">
+    <td style="${colLabel}"></td>
+    <td style="${colThis}font-size:11px;color:#888;font-weight:bold;">${monthLabel}</td>
+    <td style="${colPrev}font-size:11px;font-weight:bold;">${prevMonthLabel}</td></tr>`;
+
+  let html = `
+  <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;color:#1D1D1D;">
+    <div style="background:${navy};color:#fff;padding:16px 24px;border-radius:8px 8px 0 0;">
+      <h1 style="margin:0;font-size:20px;">CS Command Center — Monthly Summary</h1>
+      <p style="margin:4px 0 0;font-size:13px;color:#C3D3D7;">${monthLabel} (${curr.days} working days)</p>
+    </div>
+    <div style="padding:20px 24px;">`;
+
+  // ── EMAIL / ZENDESK ──
+  html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+    <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Email (Zendesk)</h2>
+    <table style="width:100%;font-size:13px;border-collapse:collapse;">
+      ${headerRow}
+      <tr><td style="${colLabel}">Avg Daily Open Tickets</td><td style="${colThis}font-weight:bold;">${curr.avgOpenTickets}</td>${prevCell(curr.avgOpenTickets, prev ? prev.avgOpenTickets : null)}</tr>
+      <tr><td style="${colLabel}">Avg Daily Past SLA</td><td style="${colThis}font-weight:bold;color:${curr.avgPastSla > 0 ? '#C62828' : '#2E7D32'};">${curr.avgPastSla}</td>${prevCell(curr.avgPastSla, prev ? prev.avgPastSla : null)}</tr>
+      <tr><td style="${colLabel}">Avg Daily Unassigned</td><td style="${colThis}font-weight:bold;">${curr.avgUnassigned}</td>${prevCell(curr.avgUnassigned, prev ? prev.avgUnassigned : null)}</tr>
+      <tr><td style="${colLabel}">Total Tickets Solved</td><td style="${colThis}font-weight:bold;">${curr.totalSolved}</td>${prevCell(curr.totalSolved, prev ? prev.totalSolved : null)}</tr>
+      <tr><td style="${colLabel}">Avg Solved/Day</td><td style="${colThis}font-weight:bold;">${(curr.totalSolved / curr.days).toFixed(1)}</td>${prev ? `<td style="${colPrev}">${(prev.totalSolved / prev.days).toFixed(1)}</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>
+    </table>`;
+
+  // Per-agent solved
+  html += `<div style="margin-top:12px;font-size:12px;color:#666;font-weight:bold;">Per Agent — Solved</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:4px;">
+      <tr style="color:#888;"><td style="${colLabel}">Agent</td><td style="${colThis}">${monthLabel.split(" ")[0]}</td><td style="${colPrev}">${prev ? prevMonthLabel.split(" ")[0] : ""}</td></tr>`;
+  curr.agentSolved.forEach((a, i) => {
+    const prevVal = prev ? prev.agentSolved[i].total : null;
+    html += `<tr><td style="${colLabel}">${a.name.split(" ")[0]}</td><td style="${colThis}">${a.total}</td><td style="${colPrev}">${prevVal !== null ? prevVal : noData}</td></tr>`;
+  });
+  html += `</table></div>`;
+
+  // ── PHONE ──
+  html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+    <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Phone (Aircall)</h2>
+    <table style="width:100%;font-size:13px;border-collapse:collapse;">
+      ${headerRow}
+      <tr><td style="${colLabel}">Avg Answer Rate</td><td style="${colThis}font-weight:bold;color:${curr.avgAnswerRate >= 75 ? '#2E7D32' : '#C62828'};">${curr.avgAnswerRate}%</td>${prevCell(curr.avgAnswerRate, prev ? prev.avgAnswerRate : null, "%")}</tr>
+      <tr><td style="${colLabel}">Total Inbound</td><td style="${colThis}font-weight:bold;">${curr.totalInbound}</td>${prevCell(curr.totalInbound, prev ? prev.totalInbound : null)}</tr>
+      <tr><td style="${colLabel}">Forwarded to SAS</td><td style="${colThis}font-weight:bold;">${curr.totalForwarded}</td>${prevCell(curr.totalForwarded, prev ? prev.totalForwarded : null)}</tr>
+      <tr><td style="${colLabel}">Total Outbound</td><td style="${colThis}font-weight:bold;">${curr.totalOutbound}</td>${prevCell(curr.totalOutbound, prev ? prev.totalOutbound : null)}</tr>
+    </table>`;
+
+  // Per-agent calls
+  html += `<div style="margin-top:12px;font-size:12px;color:#666;font-weight:bold;">Per Agent — Calls</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;margin-top:4px;">
+      <tr style="color:#888;"><td style="width:34%;">Agent</td><td style="width:16%;text-align:right;">In</td><td style="width:16%;text-align:right;">Out</td><td style="width:17%;text-align:right;font-size:11px;">${prev ? "Prev In" : ""}</td><td style="width:17%;text-align:right;font-size:11px;">${prev ? "Prev Out" : ""}</td></tr>`;
+  curr.agentInbound.forEach((a, i) => {
+    const outTotal = curr.agentOutbound[i].total;
+    const prevIn = prev ? prev.agentInbound[i].total : null;
+    const prevOut = prev ? prev.agentOutbound[i].total : null;
+    if (a.total > 0 || outTotal > 0) {
+      html += `<tr><td style="width:34%;padding:2px 0;">${a.name.split(" ")[0]}</td><td style="width:16%;text-align:right;">${a.total}</td><td style="width:16%;text-align:right;">${outTotal}</td>`;
+      html += `<td style="width:17%;text-align:right;color:#888;font-size:11px;">${prevIn !== null ? prevIn : ""}</td>`;
+      html += `<td style="width:17%;text-align:right;color:#888;font-size:11px;">${prevOut !== null ? prevOut : ""}</td></tr>`;
+    }
+  });
+  html += `</table></div>`;
+
+  // ── CSAT ──
+  if (curr.totalCsatResponses > 0 || curr.totalPhoneCsatResponses > 0) {
+    html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+      <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Customer Satisfaction</h2>
+      <table style="width:100%;font-size:13px;border-collapse:collapse;">
+        ${headerRow}`;
+    if (curr.avgCsatPct !== null) {
+      html += `<tr><td style="${colLabel}">Email CSAT</td><td style="${colThis}font-weight:bold;">${Math.round(curr.avgCsatPct)}% (${curr.totalCsatResponses} reviews)</td>${prev && prev.avgCsatPct !== null ? `<td style="${colPrev}">${Math.round(prev.avgCsatPct)}% (${prev.totalCsatResponses})</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>`;
+    }
+    if (curr.avgPhoneCsatPct !== null) {
+      html += `<tr><td style="${colLabel}">Phone CSAT</td><td style="${colThis}font-weight:bold;">${Math.round(curr.avgPhoneCsatPct)}% (${curr.totalPhoneCsatResponses} reviews)</td>${prev && prev.avgPhoneCsatPct !== null ? `<td style="${colPrev}">${Math.round(prev.avgPhoneCsatPct)}% (${prev.totalPhoneCsatResponses})</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>`;
+    }
+    html += `</table></div>`;
+  }
+
+  // ── SOCIAL ──
+  html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+    <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">Social & SMS</h2>
+    <table style="width:100%;font-size:13px;border-collapse:collapse;">
+      ${headerRow}
+      <tr><td style="${colLabel}">Avg Unread DMs at EOD</td><td style="${colThis}font-weight:bold;">${curr.avgUnreadDMs}</td>${prevCell(curr.avgUnreadDMs, prev ? prev.avgUnreadDMs : null)}</tr>
+      <tr><td style="${colLabel}">Total SMS In/Out</td><td style="${colThis}font-weight:bold;">${curr.totalSmsInbound} / ${curr.totalSmsOutbound}</td>${prev ? `<td style="${colPrev}">${prev.totalSmsInbound} / ${prev.totalSmsOutbound}</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>
+    </table></div>`;
+
+  // Footer
+  html += `<div style="text-align:center;font-size:11px;color:#999;padding-top:8px;">
+      CS Command Center v1.8.1 · Monthly Summary · ${monthLabel}
+      ${prev ? '<br>Comparison: ' + prevMonthLabel + ' (' + prev.days + ' working days)' : '<br>No prior month data available for comparison'}
+    </div>
+    </div>
+  </div>`;
+
+  const subject = `CS Monthly Summary — ${monthLabel} — Solved: ${curr.totalSolved} · Avg Open: ${curr.avgOpenTickets} · Answer Rate: ${curr.avgAnswerRate}%`;
+
+  GmailApp.sendEmail(recipients, subject, "View this email with HTML enabled.", {
+    htmlBody: html,
+    name: "CS Command Center",
+  });
+
+  Logger.log("Monthly summary sent to: " + recipients);
+}
+
+// Helper: format "2026-05-19" as "May 19"
+function formatDateShort(dateStr, tz) {
+  const d = new Date(dateStr + "T12:00:00");
+  return Utilities.formatDate(d, tz, "MMM d");
+}
+
+// ─── TEST FUNCTIONS FOR WEEKLY / MONTHLY ───
+function testWeeklySummary() {
+  loadThresholds();
+  const tz = CONFIG.businessHours.timezone;
+  sendWeeklySummary(new Date(), tz);
+}
+
+function testMonthlySummary() {
+  loadThresholds();
+  const tz = CONFIG.businessHours.timezone;
+  sendMonthlySummary(new Date(), tz);
+}
+
+// ─── BACKFILL HISTORICAL METRICS ───
+// Processes ONE day per execution to stay well under the 6-minute Apps Script limit.
+// Pulls "flow" metrics (solved tickets, calls, CSAT) from APIs.
+// "Stock" metrics (open count, unassigned, past SLA) are left blank — can't reconstruct point-in-time.
+//
+// Usage:
+//   1. Set Script Property BACKFILL_START_DATE = "2026-04-01" (or however far back you want)
+//   2. Run setupBackfillTrigger() from the editor — it creates a trigger every 8 minutes
+//   3. Watch the Daily Metrics Log sheet fill up
+//   4. When caught up, the trigger auto-deletes itself
+function backfillOneDay() {
+  loadThresholds();
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+  const startDate = props.getProperty("BACKFILL_START_DATE");
+  if (!startDate) {
+    Logger.log("BACKFILL_START_DATE not set — nothing to backfill");
+    cleanupBackfillTrigger();
+    return;
+  }
+
+  // Determine the next date to process
+  const nextDate = props.getProperty("BACKFILL_NEXT_DATE") || startDate;
+  const todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+
+  if (nextDate >= todayStr) {
+    Logger.log("Backfill complete — caught up to today (" + todayStr + ")");
+    props.deleteProperty("BACKFILL_NEXT_DATE");
+    props.deleteProperty("BACKFILL_START_DATE");
+    cleanupBackfillTrigger();
+    return;
+  }
+
+  // Check if this is a non-working day — skip it
+  const dateObj = new Date(nextDate + "T12:00:00");
+  const holidays = getDeakoHolidays();
+  if (isNonWorkingDay(dateObj, holidays)) {
+    Logger.log("Skipping non-working day: " + nextDate);
+    advanceBackfillDate(props, nextDate);
+    return;
+  }
+
+  // Check if already logged
+  const existing = readMetricsLog(nextDate, nextDate);
+  if (existing.length > 0) {
+    Logger.log("Already have data for " + nextDate + " — skipping");
+    advanceBackfillDate(props, nextDate);
+    return;
+  }
+
+  Logger.log("Backfilling metrics for: " + nextDate);
+  const dayOfWeek = Utilities.formatDate(dateObj, tz, "EEEE");
+
+  // ── Zendesk: Solved tickets that day ──
+  const token = props.getProperty("ZENDESK_TOKEN");
+  const subdomain = CONFIG.zendesk.subdomain;
+  const authHeader = "Basic " + Utilities.base64Encode(token);
+  const zdHeaders = { "Authorization": authHeader, "Content-Type": "application/json" };
+  const zdOpts = { method: "get", headers: zdHeaders, muteHttpExceptions: true };
+
+  function zdCount(query) {
+    try {
+      const url = `https://${subdomain}.zendesk.com/api/v2/search/count.json?query=${encodeURIComponent(query)}`;
+      const resp = UrlFetchApp.fetch(url, zdOpts);
+      if (resp.getResponseCode() === 200) return JSON.parse(resp.getContentText()).count || 0;
+    } catch (e) { Logger.log("Zendesk search failed: " + e); }
+    return 0;
+  }
+
+  const nextDatePlusOne = Utilities.formatDate(new Date(dateObj.getTime() + 86400000), tz, "yyyy-MM-dd");
+  const solvedTotal = zdCount(`type:ticket solved>=${nextDate} solved<${nextDatePlusOne}`);
+  const agentSolved = CONFIG.agents.map(a =>
+    zdCount(`type:ticket solved>=${nextDate} solved<${nextDatePlusOne} assignee:"${a}"`)
+  );
+
+  // ── Aircall: Calls that day ──
+  let inboundCalls = 0;
+  let forwardedToSAS = 0;
+  let outboundCalls = 0;
+  let answeredCalls = 0;
+  let avgWaitTime = 0;
+  let avgDuration = 0;
+  const agentIn = CONFIG.agents.map(() => 0);
+  const agentOut = CONFIG.agents.map(() => 0);
+
+  try {
+    const apiId = props.getProperty("AIRCALL_API_ID");
+    const apiToken = props.getProperty("AIRCALL_API_TOKEN");
+    if (apiId && apiToken) {
+      const baseUrl = CONFIG.aircall.baseUrl;
+      const auth = "Basic " + Utilities.base64Encode(apiId + ":" + apiToken);
+
+      // Start/end of the day in local timezone
+      const dayStart = new Date(nextDate + "T00:00:00");
+      const dayEnd = new Date(nextDate + "T23:59:59");
+      // Approximate: use Pacific timezone offset manually
+      const fromTs = Math.floor(dayStart.getTime() / 1000) + 7 * 3600; // rough PST offset
+      const toTs = Math.floor(dayEnd.getTime() / 1000) + 7 * 3600;
+
+      let allCalls = [];
+      let page = 1;
+      let hasMore = true;
+      while (hasMore && page <= 10) {
+        const url = `${baseUrl}/calls?from=${fromTs}&to=${toTs}&per_page=50&page=${page}&order=desc`;
+        const resp = UrlFetchApp.fetch(url, { method: "get", headers: { "Authorization": auth }, muteHttpExceptions: true });
+        if (resp.getResponseCode() !== 200) break;
+        const data = JSON.parse(resp.getContentText());
+        allCalls = allCalls.concat(data.calls || []);
+        hasMore = data.meta && data.meta.next_page_link;
+        page++;
+      }
+
+      const supportNumbers = CONFIG.aircall.supportNumbers;
+      const answerSvcNum = (CONFIG.aircall.answeringServiceNumber || "").replace(/[\s\-\(\)]/g, "");
+      const supportCalls = allCalls.filter(c => {
+        if (!c.number) return false;
+        const digits = (c.number.digits || "").replace(/[\s\-\(\)]/g, "");
+        return supportNumbers.some(sn => digits.includes(sn.replace(/[\s\-\(\)]/g, "")) || sn.replace(/[\s\-\(\)]/g, "").includes(digits));
+      });
+
+      // Inbound during business hours
+      const bh = CONFIG.businessHours;
+      const bizInbound = supportCalls.filter(c => {
+        if (c.direction !== "inbound" || !c.started_at) return false;
+        const cd = new Date(c.started_at * 1000);
+        const ps = cd.toLocaleString("en-US", { timeZone: bh.timezone });
+        const pd = new Date(ps);
+        const dow = pd.getDay();
+        const hr = pd.getHours();
+        return bh.workDays.includes(dow) && hr >= bh.startHour && hr < bh.endHour;
+      });
+
+      // Team answered
+      const teamAns = bizInbound.filter(c => c.answered_at && c.user && (c.missed_call_reason || "") !== "short_abandoned");
+      answeredCalls = teamAns.length;
+      inboundCalls = answeredCalls;
+
+      // Forwarded to SAS
+      forwardedToSAS = supportCalls.filter(c => {
+        if (c.direction !== "outbound") return false;
+        const rd = (c.raw_digits || "").replace(/[\s\-\(\)]/g, "");
+        return answerSvcNum && rd.includes(answerSvcNum.replace("+1", ""));
+      }).length;
+
+      // Outbound (exclude SAS)
+      outboundCalls = supportCalls.filter(c => {
+        if (c.direction !== "outbound") return false;
+        const rd = (c.raw_digits || "").replace(/[\s\-\(\)]/g, "");
+        return !(answerSvcNum && rd.includes(answerSvcNum.replace("+1", "")));
+      }).length;
+
+      // Answer rate
+      const answerRate = (answeredCalls + forwardedToSAS) > 0
+        ? Math.round(answeredCalls / (answeredCalls + forwardedToSAS) * 100) : 100;
+
+      // Avg wait/duration
+      const waits = teamAns.map(c => c.waiting_duration || 0).filter(w => w > 0);
+      avgWaitTime = waits.length > 0 ? Math.round(waits.reduce((a, b) => a + b, 0) / waits.length) : 0;
+      const durs = teamAns.map(c => c.duration || 0).filter(d => d > 0);
+      avgDuration = durs.length > 0 ? Math.round(durs.reduce((a, b) => a + b, 0) / durs.length) : 0;
+
+      // Per-agent
+      teamAns.forEach(c => {
+        const user = c.user;
+        if (!user) return;
+        const name = (user.name || `${user.first_name || ""} ${user.last_name || ""}`.trim());
+        CONFIG.agents.forEach((a, idx) => {
+          const parts = a.toLowerCase().split(" ");
+          const cparts = name.toLowerCase().split(" ");
+          if (parts[0] === cparts[0] || (parts[1] && cparts[1] && parts[1] === cparts[1])) {
+            agentIn[idx]++;
+          }
+        });
+      });
+
+      supportCalls.filter(c => c.direction === "outbound" && c.user).forEach(c => {
+        const rd = (c.raw_digits || "").replace(/[\s\-\(\)]/g, "");
+        if (answerSvcNum && rd.includes(answerSvcNum.replace("+1", ""))) return;
+        const name = (c.user.name || `${c.user.first_name || ""} ${c.user.last_name || ""}`.trim());
+        CONFIG.agents.forEach((a, idx) => {
+          const parts = a.toLowerCase().split(" ");
+          const cparts = name.toLowerCase().split(" ");
+          if (parts[0] === cparts[0] || (parts[1] && cparts[1] && parts[1] === cparts[1])) {
+            agentOut[idx]++;
+          }
+        });
+      });
+
+      // Store the computed answer rate (overwrite the variable)
+      avgWaitTime = avgWaitTime; // already set
+      // We need to store answerRate — we'll put it in the row
+      inboundCalls = answeredCalls;
+      // Store answer rate in a variable we can use below
+      var computedAnswerRate = answerRate;
+    }
+  } catch (e) {
+    Logger.log("Aircall backfill error: " + e);
+  }
+
+  // ── Nicereply: CSAT for that day ──
+  let csatPct = "";
+  let csatResponses = 0;
+  let csatSatisfied = 0;
+  try {
+    const nrToken = props.getProperty("NICEREPLY_TOKEN");
+    if (nrToken) {
+      const nrAuth = "Basic " + Utilities.base64Encode(nrToken);
+      const sinceISO = nextDate + "T00:00:00Z";
+      const untilISO = nextDatePlusOne + "T00:00:00Z";
+      let allResponses = [];
+      let nrPage = 1;
+      let nrMore = true;
+      while (nrMore && nrPage <= 5) {
+        const url = `https://api.nicereply.com/responses?created_after=${encodeURIComponent(sinceISO)}&created_before=${encodeURIComponent(untilISO)}&per_page=50&page=${nrPage}`;
+        const resp = UrlFetchApp.fetch(url, { method: "get", headers: { "Authorization": nrAuth }, muteHttpExceptions: true });
+        if (resp.getResponseCode() !== 200) break;
+        const body = JSON.parse(resp.getContentText());
+        allResponses = allResponses.concat(body.data || []);
+        const pag = body.pagination || {};
+        nrMore = pag.total_pages ? nrPage < pag.total_pages : (body.data || []).length >= 50;
+        nrPage++;
+      }
+
+      const CSAT_QID = "86bae330-e8bc-4fa3-9af9-91eb2459d348";
+      let satisfied = 0;
+      allResponses.forEach(r => {
+        const answers = r.answers || [];
+        const csatAnswer = answers.find(a => a.question_id === CSAT_QID) || answers.find(a => a.question_type === "SCALE");
+        const score = csatAnswer && csatAnswer.scale ? csatAnswer.scale.value : 0;
+        if (score >= 4) satisfied++;
+      });
+      csatResponses = allResponses.length;
+      csatSatisfied = satisfied;
+      csatPct = csatResponses > 0 ? Math.round((csatSatisfied / csatResponses) * 100) : "";
+    }
+  } catch (e) {
+    Logger.log("Nicereply backfill error: " + e);
+  }
+
+  // ── Log the row ──
+  logDailyMetrics({
+    date: nextDate,
+    dayOfWeek: dayOfWeek,
+    openTickets: "",        // can't reconstruct
+    unassigned: "",         // can't reconstruct
+    onHold: "",             // can't reconstruct
+    pastSla: "",            // can't reconstruct
+    sasTickets: "",         // can't reconstruct
+    openVoicemails: "",     // can't reconstruct
+    aiAgentTickets: "",     // can't reconstruct
+    solvedTotal: solvedTotal,
+    agentSolved: agentSolved,
+    agentInbound: agentIn,
+    agentOutbound: agentOut,
+    answerRate: typeof computedAnswerRate !== "undefined" ? computedAnswerRate : "",
+    inboundCalls: inboundCalls,
+    forwardedToSAS: forwardedToSAS,
+    outboundCalls: outboundCalls,
+    avgWaitTime: avgWaitTime,
+    avgCallDuration: avgDuration,
+    csatPct: csatPct,
+    csatResponses: csatResponses,
+    csatSatisfied: csatSatisfied,
+    phoneCsatPct: "",       // post-call CSAT not easily backfillable
+    phoneCsatResponses: 0,
+    unreadDMs: "",          // can't reconstruct
+    smsInbound: "",         // SMS log could be read, but skip for now
+    smsOutbound: "",
+  });
+
+  advanceBackfillDate(props, nextDate);
+  Logger.log("Backfill complete for " + nextDate);
+}
+
+function advanceBackfillDate(props, currentDate) {
+  const next = new Date(currentDate + "T12:00:00");
+  next.setDate(next.getDate() + 1);
+  const tz = CONFIG.businessHours.timezone;
+  const nextStr = Utilities.formatDate(next, tz, "yyyy-MM-dd");
+  props.setProperty("BACKFILL_NEXT_DATE", nextStr);
+}
+
+function setupBackfillTrigger() {
+  cleanupBackfillTrigger();
+  ScriptApp.newTrigger("backfillOneDay")
+    .timeBased()
+    .everyMinutes(10)
+    .create();
+  Logger.log("Backfill trigger created — runs every 10 minutes. Set BACKFILL_START_DATE to begin.");
+}
+
+function cleanupBackfillTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "backfillOneDay") {
+      ScriptApp.deleteTrigger(t);
+      Logger.log("Removed backfill trigger");
+    }
+  });
+}
+
 // Slimmed-down email for weekends and Deako holidays — queue state only, no performance metrics
 function sendNonWorkingDaySnapshot(zendesk, meta, now, dateStr, tz, recipients) {
   const props = PropertiesService.getScriptProperties();
@@ -4381,7 +5341,7 @@ function sendNonWorkingDaySnapshot(zendesk, meta, now, dateStr, tz, recipients) 
       </div>
 
       <div style="text-align:center;padding:16px 0 8px;font-size:11px;color:#999;">
-        CS Command Center v1.7.0 · Non-Working Day Snapshot · ${dateStr}
+        CS Command Center v1.8.1 · Non-Working Day Snapshot · ${dateStr}
       </div>
     </div>
   </div>`;
@@ -4430,6 +5390,38 @@ function setupDailyRecapTrigger() {
     .create();
 
   Logger.log("Daily recap trigger set for 6:00 PM PST");
+}
+
+// Set up weekly + monthly summary triggers (run once from Apps Script editor)
+function setupWeeklyMonthlyTriggers() {
+  // Remove existing weekly/monthly triggers
+  ScriptApp.getProjectTriggers().forEach(t => {
+    const fn = t.getHandlerFunction();
+    if (fn === "checkAndSendWeeklySummary" || fn === "checkAndSendMonthlySummary") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // Weekly check: daily at 6:15pm — only sends on last working day of week
+  ScriptApp.newTrigger("checkAndSendWeeklySummary")
+    .timeBased()
+    .atHour(18)
+    .nearMinute(15)
+    .everyDays(1)
+    .inTimezone("America/Los_Angeles")
+    .create();
+
+  // Monthly check: daily at 6:30pm — only sends on last business day of month
+  ScriptApp.newTrigger("checkAndSendMonthlySummary")
+    .timeBased()
+    .atHour(18)
+    .nearMinute(30)
+    .everyDays(1)
+    .inTimezone("America/Los_Angeles")
+    .create();
+
+  Logger.log("Weekly summary trigger set for ~6:15 PM PST (sends on last working day of week)");
+  Logger.log("Monthly summary trigger set for ~6:30 PM PST (sends on last business day of month)");
 }
 
 // --- DEBUG: Voicemail ticket inspection (run from editor, delete after) ---
@@ -4570,4 +5562,5 @@ function formatBizMinutes(min) {
   if (hours < 10) return hours.toFixed(1) + "h";
   return Math.round(hours) + "h";
 }
+
 
