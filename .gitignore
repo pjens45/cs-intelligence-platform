@@ -24,6 +24,9 @@ Thumbs.db
 *.js
 !cs_command_center_apps_script_v2.js
 
+# Nested/unrelated repos
+gitlab-tap/
+
 # Keep only the script, readme, gitignore, and screenshots
 !.gitignore
 !dashboard_screenshot.png
