@@ -17,10 +17,14 @@ Thumbs.db
 *.html
 *.json
 *.md
+*.txt
 !README.md
 
-# Keep only the script, readme, gitignore, and screenshots
+# Source files (keep only the v2 script)
+*.js
 !cs_command_center_apps_script_v2.js
+
+# Keep only the script, readme, gitignore, and screenshots
 !.gitignore
 !dashboard_screenshot.png
 !agent_hub_screenshot.png
