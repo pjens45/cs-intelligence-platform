@@ -1,4 +1,4 @@
-# CS Intelligence Platform
+# CS Visibility Platform
 
 AI-powered customer support intelligence built on Google Apps Script. Unifies your ticket system, phone platform, CSAT tools, and social channels into a single operational view - then uses an LLM to tell you what your customers are actually saying.
 

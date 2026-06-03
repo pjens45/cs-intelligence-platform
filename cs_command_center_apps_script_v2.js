@@ -3916,7 +3916,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
 
   // Footer — version & goals
   dash.getRange(`A${lastRow}:Z${lastRow}`).merge()
-    .setValue(`CS Intelligence · Command Center v2.5.4  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon-Fri 6a-5p PST`)
+    .setValue(`CS Visibility · Command Center v2.5.4  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon-Fri 6a-5p PST`)
     .setFontColor(gray).setFontSize(8).setFontStyle("italic")
     .setHorizontalAlignment("center").setBackground(bg);
 
@@ -5920,7 +5920,7 @@ function sendDailyRecap(recipientOverride, skipSave) {
         <div style="margin-bottom:4px;">The "${compLabel}" column shows the previous working day's end-of-day values for comparison.</div>
       </div>
       <div style="text-align:center;padding:8px 0;font-size:11px;color:#999;">
-        CS Intelligence · AI Recap v2.5.4 · End of Day Summary · ${dateStr}
+        CS Visibility · AI Recap v2.5.4 · End of Day Summary · ${dateStr}
       </div>
     </div>
   </div>`;
@@ -6075,7 +6075,7 @@ function sendDailyRecap(recipientOverride, skipSave) {
 
   GmailApp.sendEmail(recipients, subject, "View this email with HTML enabled.", {
     htmlBody: html,
-    name: "CS Intelligence",
+    name: "CS Visibility",
   });
 
   Logger.log("End of day summary sent to: " + recipients);
@@ -6967,7 +6967,7 @@ function sendWeeklySummary(now, tz, recipientOverride) {
         <div style="margin-bottom:4px;">Social: Healthy = oldest unread DM under ${th.socialResponseTime.green / 60}h · Watch = ${th.socialResponseTime.green / 60}-${th.socialResponseTime.yellow / 60}h · At Risk = over ${th.socialResponseTime.yellow / 60}h</div>
       </div>`;
   html += `<div style="text-align:center;font-size:11px;color:#999;padding-top:8px;">
-      CS Intelligence · AI Recap v2.5.4 · Weekly Summary · ${weekLabel}
+      CS Visibility · AI Recap v2.5.4 · Weekly Summary · ${weekLabel}
       ${prev ? '<br>Comparison: ' + prevWeekLabel : '<br>No prior week data available for comparison'}
     </div>
     </div>
@@ -6977,7 +6977,7 @@ function sendWeeklySummary(now, tz, recipientOverride) {
 
   GmailApp.sendEmail(recipients, subject, "View this email with HTML enabled.", {
     htmlBody: html,
-    name: "CS Intelligence",
+    name: "CS Visibility",
   });
 
   Logger.log("Weekly summary sent to: " + recipients);
@@ -7261,7 +7261,7 @@ function sendMonthlySummary(now, tz, recipientOverride) {
         <div style="margin-bottom:4px;">Social: Healthy = oldest unread DM under ${th.socialResponseTime.green / 60}h · Watch = ${th.socialResponseTime.green / 60}-${th.socialResponseTime.yellow / 60}h · At Risk = over ${th.socialResponseTime.yellow / 60}h</div>
       </div>`;
   html += `<div style="text-align:center;font-size:11px;color:#999;padding-top:8px;">
-      CS Intelligence · AI Recap v2.5.4 · Monthly Summary · ${monthLabel}
+      CS Visibility · AI Recap v2.5.4 · Monthly Summary · ${monthLabel}
       ${prev ? '<br>Comparison: ' + prevMonthLabel + ' (' + prev.days + ' working days)' : '<br>No prior month data available for comparison'}
     </div>
     </div>
@@ -7271,7 +7271,7 @@ function sendMonthlySummary(now, tz, recipientOverride) {
 
   GmailApp.sendEmail(recipients, subject, "View this email with HTML enabled.", {
     htmlBody: html,
-    name: "CS Intelligence",
+    name: "CS Visibility",
   });
 
   Logger.log("Monthly summary sent to: " + recipients);
@@ -7973,7 +7973,7 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
     const footerRow = maxRow + 1;
     sheet.setRowHeight(footerRow, 22);
     sheet.getRange(footerRow, 1, 1, totalCols).merge()
-      .setValue(`CS Intelligence · Agent Hub v2.5.4  ·  ${dateStr}  ·  Team avg = average across ${agents.length} agents`)
+      .setValue(`CS Visibility · Agent Hub v2.5.4  ·  ${dateStr}  ·  Team avg = average across ${agents.length} agents`)
       .setFontColor(dimFg).setFontSize(8).setFontStyle("italic")
       .setHorizontalAlignment("center").setBackground(bg).setFontFamily("Arial");
 
@@ -8309,7 +8309,7 @@ function updateHealthTrends() {
   const footerRow = 46; // below all 3 charts + legends
   const footerCols = 10; // cols H (8) through Q (17)
   const footerLines = [
-    `CS Intelligence · Command Center v2.5.4  ·  Health Trends  ·  Business days only (Mon-Fri, weekends excluded)`,
+    `CS Visibility · Command Center v2.5.4  ·  Health Trends  ·  Business days only (Mon-Fri, weekends excluded)`,
     `Email: Healthy = 0-5 past SLA, Watch = 6-10 past SLA, At Risk = 11+ past SLA`,
     `Phone: Healthy = answer rate >= ${th.phoneAnswerRate.green}%, Watch = ${th.phoneAnswerRate.yellow}-${th.phoneAnswerRate.green - 1}%, At Risk = < ${th.phoneAnswerRate.yellow}%`,
     `Social: Healthy = oldest unread DM <= ${th.socialResponseTime.green / 60}h, Watch = ${th.socialResponseTime.green / 60}-${th.socialResponseTime.yellow / 60}h, At Risk = > ${th.socialResponseTime.yellow / 60}h`,
@@ -8932,7 +8932,7 @@ function sendNonWorkingDaySnapshot(zendesk, meta, now, dateStr, tz, recipients) 
 
   html += `
       <div style="text-align:center;padding:16px 0 8px;font-size:11px;color:#999;">
-        CS Intelligence · AI Recap v2.5.4 · Non-Working Day · ${dateStr}
+        CS Visibility · AI Recap v2.5.4 · Non-Working Day · ${dateStr}
       </div>
     </div>
   </div>`;
@@ -8941,7 +8941,7 @@ function sendNonWorkingDaySnapshot(zendesk, meta, now, dateStr, tz, recipients) 
 
   GmailApp.sendEmail(recipients, subject, "View this email with HTML enabled.", {
     htmlBody: html,
-    name: "CS Intelligence",
+    name: "CS Visibility",
   });
 
   Logger.log("Non-working day snapshot sent to: " + recipients);
