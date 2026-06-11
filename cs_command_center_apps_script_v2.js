@@ -23,6 +23,21 @@
 // ============================================================
 
 // --- CONFIGURATION ---
+// Roster / PII config is loaded from Script Properties so the code ships with no
+// names, emails, phone numbers, or schedules. Set these in
+// Project Settings > Script Properties (all optional; blank = empty list):
+//   CS_AGENTS            = comma-separated full names of CS support agents (e.g. "Jane Doe, John Roe")
+//   CS_EXCLUDE_AGENTS    = comma-separated names that use Zendesk but are NOT on the CS team
+//   CS_EXCLUDE_POSTCALL  = comma-separated names to exclude from phone CSAT (PostCall surveys)
+//   CS_EXCLUDE_SMS_LINES = comma-separated Aircall line labels/names to exclude from SMS tracking
+//   CS_SUPPORT_NUMBERS   = comma-separated CS support phone lines in +1XXXXXXXXXX form
+//   CS_ANSWERING_SERVICE = external answering-service phone number (+1XXXXXXXXXX)
+//   CS_THROUGHPUT_AGENTS = JSON map of agent -> { email, schedule:[{from,dailyHours,workdays}] } (see THROUGHPUT_CONFIG)
+function _csvProp(key) {
+  const v = PropertiesService.getScriptProperties().getProperty(key) || "";
+  return v.split(",").map(s => s.trim()).filter(Boolean);
+}
+
 const CONFIG = {
   zendesk: {
     subdomain: "deako",
@@ -30,21 +45,17 @@ const CONFIG = {
   },
   aircall: {
     baseUrl: "https://api.aircall.io/v1",
-    // Only count calls on these CS support lines (digits format from Aircall API)
-    supportNumbers: [
-      "+18449030847",   // nonpro support
-      "+18442033196",   // pro support
-      "+14259880376",   // distributor support
-    ],
-    answeringServiceNumber: "+10000000000",  // external call answer service
+    // Only count calls on these CS support lines (digits format from Aircall API). From CS_SUPPORT_NUMBERS.
+    supportNumbers: _csvProp("CS_SUPPORT_NUMBERS"),
+    answeringServiceNumber: PropertiesService.getScriptProperties().getProperty("CS_ANSWERING_SERVICE") || "",  // external call answer service
   },
-  agents: ["Agent A", "Agent B", "Agent C"],
+  agents: _csvProp("CS_AGENTS"),
   // Agents who use Zendesk but are NOT on the support team — exclude from all dashboard stats
-  excludeAgents: ["Excluded"],
+  excludeAgents: _csvProp("CS_EXCLUDE_AGENTS"),
   // Agents to exclude from phone CSAT (PostCall surveys) — not on CS team
-  excludePostCallAgents: ["AgentD"],
+  excludePostCallAgents: _csvProp("CS_EXCLUDE_POSTCALL"),
   // Aircall lines to exclude from SMS activity tracking
-  excludeSMSLines: ["nonpro sales (post close)", "Agent D", "Agent E", "Agent F", "Agent G", "Agent H", "Agent I", "Agent J", "Agent K", "Agent L", "Agent M", "Agent N"],
+  excludeSMSLines: _csvProp("CS_EXCLUDE_SMS_LINES"),
   // Business hours for phone metrics (calls outside these hours excluded from answer rate)
   businessHours: {
     timezone: "America/Los_Angeles",  // Pacific
@@ -166,18 +177,32 @@ function refreshDashboard() {
     return;  // outside Mon–Fri 6am–5pm Pacific — skip silently
   }
 
+  // Prevent overlapping refreshes: if the previous tick is still running, skip this one.
+  // A refresh often runs longer than the 5-min trigger interval; without this the runs pile up,
+  // contend for the spreadsheet, and inflate each other's duration (and burn execution quota).
+  const refreshLock = LockService.getScriptLock();
+  if (!refreshLock.tryLock(0)) {
+    Logger.log("refreshDashboard: previous run still in progress - skipping this tick.");
+    return;
+  }
+
+  try {
   loadThresholds();  // read SLA targets from Script Properties (falls back to defaults)
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const runLog = getOrCreateSheet(ss, "Run Log");
   const startTime = new Date();
 
   try {
-    const zendeskData = fetchZendeskStatus();
-    const aircallData = fetchAircallStatus();
-    const csatData = fetchNicereplyCSAT();
-    const postCallData = readPostCallCSAT();
-    const smsData = readSMSActivity();
-    const metaData = fetchMetaStatus();
+    // --- PROFILE: per-phase timers (temporary; v2.5.53). Search cloud logs for "PROFILE". ---
+    const _pStart = Date.now(); let _pMark = _pStart;
+    const _prof = (l) => { const n = Date.now(); Logger.log("PROFILE " + l + " " + ((n - _pMark) / 1000).toFixed(1) + "s"); _pMark = n; };
+
+    const zendeskData = fetchZendeskStatus(); _prof("fetchZendesk");
+    const aircallData = fetchAircallStatus(); _prof("fetchAircall");
+    const csatData = fetchNicereplyCSAT(); _prof("fetchNicereply");
+    const postCallData = readPostCallCSAT(); _prof("readPostCall");
+    const smsData = readSMSActivity(); _prof("readSMS");
+    const metaData = fetchMetaStatus(); _prof("fetchMeta");
 
     // Queue Intelligence — volume spike detection + throughput (v2)
     let qiData = null;
@@ -186,20 +211,38 @@ function refreshDashboard() {
     } catch (e) {
       Logger.log("Queue Intelligence fetch failed (non-fatal): " + e.toString());
     }
+    _prof("queueIntel");
 
-    writeZendeskRaw(ss, zendeskData);
-    writeAircallRaw(ss, aircallData);
-    writeDashboard(ss, zendeskData, aircallData, csatData, postCallData, smsData, metaData, qiData);
+    writeZendeskRaw(ss, zendeskData); _prof("writeZendeskRaw");
+    writeAircallRaw(ss, aircallData); _prof("writeAircallRaw");
+    writeDashboard(ss, zendeskData, aircallData, csatData, postCallData, smsData, metaData, qiData); _prof("writeDashboard");
 
-    // Update individual agent performance dashboards (separate spreadsheets)
-    try { updateAgentDashboards(zendeskData, aircallData, csatData, postCallData); } catch (e) {
+    // Update individual agent performance dashboards (separate spreadsheets). These are ~50s each
+    // (~52% of the refresh) and barely change intra-day, so refresh them at most every 30 min
+    // instead of every 5-min tick. Reuses the data already fetched above. Tune AGENT_DASH_MIN_MS.
+    try {
+      const AGENT_DASH_MIN_MS = 30 * 60 * 1000;
+      const agentProps = PropertiesService.getScriptProperties();
+      const lastAgent = Number(agentProps.getProperty("LAST_AGENT_DASH") || 0);
+      if (Date.now() - lastAgent >= AGENT_DASH_MIN_MS) {
+        updateAgentDashboards(zendeskData, aircallData, csatData, postCallData);
+        agentProps.setProperty("LAST_AGENT_DASH", String(Date.now()));
+      } else {
+        Logger.log("Agent dashboards skipped this tick (refreshed within last 30 min).");
+      }
+    } catch (e) {
       Logger.log("Agent dashboards update failed (non-fatal): " + e.toString());
     }
+    _prof("agentDashboards");
+    Logger.log("PROFILE total " + ((Date.now() - _pStart) / 1000).toFixed(1) + "s");
 
     logRun(runLog, startTime, "SUCCESS", "");
   } catch (error) {
     logRun(runLog, startTime, "ERROR", error.toString());
     Logger.log("Dashboard refresh failed: " + error.toString());
+  }
+  } finally {
+    refreshLock.releaseLock();
   }
 }
 
@@ -430,7 +473,7 @@ function fetchZendeskStatus() {
   const createdQuery = `type:ticket created>=${todayStr} ${solvedExclusions}`;
   const ticketsCreatedToday = zendeskSearchCount(createdQuery);
 
-  // Find who the "Other" solvers are so we can label the row (e.g. "Other (Manager)")
+  // Find who the "Other" solvers are so we can label the row (e.g. "Other (manager)")
   const otherSolverNames = new Set();
   if (handledToday["Other"] > 0) {
     // Fetch a few "Other" solved tickets to extract assignee names
@@ -877,10 +920,6 @@ Identify the top 3 themes from today's activity.`;
           const escapedSummary = (t.summary || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
           // Build clickable ticket links
-          const ticketLinks = (t.ticket_ids || []).map(id =>
-            `<a href="https://${subdomain2}.zendesk.com/agent/tickets/${id}" style="color:#7597A0;text-decoration:none;">#${id}</a>`
-          ).join(", ");
-
           // Build sentiment sentence from per-ticket sentiments
           let sentimentSentence = "";
           const sentiments = t.ticket_sentiments || {};
@@ -910,7 +949,7 @@ Identify the top 3 themes from today's activity.`;
 
           // Theme header + summary
           themesHtml += `${i + 1}. <strong>${escapedTheme}</strong><br>`;
-          themesHtml += `${ticketCount} tickets/calls (${ticketLinks}). ${escapedSummary}`;
+          themesHtml += `${ticketCount} tickets/calls. ${escapedSummary}`;
           if (sentimentSentence) themesHtml += ` <span style="color:${sentColor};font-size:12px;">${sentimentSentence}</span>`;
           themesHtml += `<br>`;
 
@@ -1781,6 +1820,8 @@ For frequency, use the total of ${totalWorkingDays} working days as the denomina
 
 Integrate sentiment naturally into the summary sentence itself -- do NOT output sentiment as a separate field. Examples: "WiFi failures persist with customers reporting factual descriptions of connectivity issues." (neutral) or "Integration failures are generating increasing customer frustration, with several expressing exasperation at repeated failures." (frustrated). Always end the summary with a brief tone statement. For neutral: 'Customer tone is matter-of-fact' or 'Tone remains neutral throughout.' For frustrated: 'generating customer frustration' or 'with several customers expressing exasperation.' For mixed: 'Tone is mostly neutral with isolated frustration.' Every theme must include a tone indication.
 
+DESCRIBE, DO NOT DIAGNOSE. Report only what customers experience: the symptoms they describe, which products are affected, how often the theme recurs, and customer sentiment. Do NOT speculate about root cause or make engineering judgments. Never claim an issue is a systemic, pervasive, persistent, or widespread hardware, firmware, software, or infrastructure malfunction, defect, or failure, and do not infer an underlying technical cause from ticket volume or recurrence. Noting that a theme recurs or is rising is fine (that is frequency, not cause). Sentiment conclusions are allowed (e.g., "...indicating growing customer frustration"); technical or root-cause conclusions are not (e.g., do NOT write "indicating a systemic hardware malfunction" or "a pervasive connectivity infrastructure problem"). End each summary with the tone statement and add no causal interpretation after it.
+
 You MUST respond with valid JSON only, no other text. Use this exact format:
 [
   {"trend": "Trend Name", "frequency": "appeared X of ${totalWorkingDays} working days", "summary": "One sentence on the pattern with sentiment woven in naturally."},
@@ -2095,7 +2136,7 @@ function fetchAircallStatus() {
   const customerCalls = bizHourCalls.filter(call => call.direction === "inbound");
 
   // Categorize inbound calls
-  const teamAnswered = [];      // team agent picked up
+  const teamAnswered = [];      // ALL Deako pickups (any internal user) — drives team answer rate
   const shortAbandoned = [];    // caller hung up too fast to count
 
   customerCalls.forEach(call => {
@@ -2104,12 +2145,11 @@ function fetchAircallStatus() {
     if (reason === "short_abandoned") {
       shortAbandoned.push(call);
     } else if (call.answered_at && call.user) {
-      const matched = matchAgent(call);
-      if (matched) {
-        teamAnswered.push({ call, agent: matched });
-      }
-      // Calls answered by non-CONFIG users (e.g. SAS) are no longer double-counted here;
-      // they are already captured by forwardedToSAS above.
+      // SAS only ever handles calls via the forward (outbound-to-SAS), never as an
+      // inbound pickup, so any answered inbound here is a Deako pickup. Count every
+      // pickup toward the team answer rate (core agents + managers / other helpers).
+      // agent = matched core agent, or null when answered by a non-core user.
+      teamAnswered.push({ call, agent: matchAgent(call) });
     }
     // Calls with missed_call_reason (agents_did_not_answer, etc.) are also already
     // captured by the outbound-to-SAS count, so we don't double-count them.
@@ -2197,6 +2237,7 @@ function fetchAircallStatus() {
   CONFIG.agents.forEach(name => agentStats[name] = { answered: 0, outbound: 0, outboundConnected: 0, outboundShort: 0, outboundLong: 0, inboundTalkTime: 0, outboundTalkTime: 0 });
 
   teamAnswered.forEach(t => {
+    if (!t.agent || !agentStats[t.agent]) return;   // non-core pickups count for the rate only, not per-agent
     agentStats[t.agent].answered++;
     agentStats[t.agent].inboundTalkTime += (t.call.duration || 0);
   });
@@ -2472,7 +2513,7 @@ function processNicereplyResponses(responses, since) {
 // DASHBOARD LAYOUT — Calm, minimal, on-brand instrument panel
 // =============================================================
 function writeDashboard(ss, zendesk, aircall, csat, postCall, sms, meta, qi) {
-  // Build on a hidden staging sheet, then swap — eliminates the 5-min blink
+  // Build on a hidden staging sheet, then swap — eliminates the refresh blink
   const staging = getOrCreateSheet(ss, "_Staging");
   staging.showSheet(); // ensure it exists and is accessible
   _writeDashboardContent(ss, staging, zendesk, aircall, csat, postCall, sms, meta, qi);
@@ -3916,7 +3957,7 @@ function _writeDashboardContent(ss, dash, zendesk, aircall, csat, postCall, sms,
 
   // Footer — version & goals
   dash.getRange(`A${lastRow}:Z${lastRow}`).merge()
-    .setValue(`CS Visibility · Command Center v2.5.4  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon-Fri 6a-5p PST`)
+    .setValue(`CS Visibility · Command Center v2.5.64  ·  Refreshes every 5 min  ·  Goal: reply within ${slaHours} business hours · answer ${CONFIG.thresholds.phoneAnswerRate.green}%+ inbound calls · Mon-Fri 6a-5p PST`)
     .setFontColor(gray).setFontSize(8).setFontStyle("italic")
     .setHorizontalAlignment("center").setBackground(bg);
 
@@ -4071,19 +4112,15 @@ function setupAgentMapTab(ss) {
 
   sheet.getRange("A1").setValue("Agent Name Mapping")
     .setFontSize(14).setFontWeight("bold").setFontFamily("Inter").setFontColor(BRAND.airBlueDark);
-  sheet.getRange("A2").setValue("Update CONFIG.agents in Code.gs to add/remove agents")
+  sheet.getRange("A2").setValue("Set CS_AGENTS in Script Properties to add/remove agents")
     .setFontColor(BRAND.textSecondary).setFontFamily("Inter");
 
   const headers = ["Display Name", "Zendesk Name", "Aircall Name", "Role"];
   headers.forEach((h, i) => sheet.getRange(4, i + 1).setValue(h).setFontWeight("bold")
     .setBackground(BRAND.beigeLight).setFontFamily("Inter"));
 
-  const agents = [
-    ["Agent A", "Agent A", "Agent A", "Anchor"],
-    ["Agent B", "Agent B", "Agent B", "Full-Time (Mar 1)"],
-    ["Agent C", "Agent C", "Agent C", "Ramping"],
-    ["Manager", "Manager", "Manager", "Manager"],
-  ];
+  // Built from CONFIG.agents (loaded from the CS_AGENTS Script Property) — no names hardcoded.
+  const agents = CONFIG.agents.map(name => [name, name, name, ""]);
 
   agents.forEach((a, i) => {
     a.forEach((val, j) => sheet.getRange(5 + i, j + 1).setValue(val).setFontFamily("Inter"));
@@ -4170,6 +4207,14 @@ function initializeSheet() {
 function doPost(e) {
   try {
     const ss = SpreadsheetApp.openById("1db-1Zlny6ryoAYc4CCkjXPtgXyGCGBEgWBfg5xnq7rU");
+
+    // SAS Flex Custom Action capture: tag the endpoint URL with ?src=sas. Routed here BEFORE
+    // JSON.parse because SAS may post form-encoded (non-JSON) data. Capture-only for now —
+    // logs the raw payload to a "SAS Debug" sheet so we can learn the field shape.
+    if (e && e.parameter && e.parameter.src === "sas") {
+      return handleSasDebug(ss, e);
+    }
+
     const payload = JSON.parse(e.postData.contents);
 
     // Route based on payload shape:
@@ -4190,6 +4235,45 @@ function doPost(e) {
     return ContentService.createTextOutput(JSON.stringify({ status: "error", message: err.toString() }))
       .setMimeType(ContentService.MimeType.JSON);
   }
+}
+
+// --- SAS FLEX CUSTOM ACTION WEBHOOK (capture only) ---
+// SAS Flex "Custom Action" POSTs each new call to our endpoint. The body is built from
+// user-chosen merge fields, so we don't know the field names yet. This handler records the
+// raw request to a "SAS Debug" sheet (handles both JSON and form-encoded), so we can read the
+// exact shape and then build the real parser + SAS Log. It always returns 200 so SAS sees success.
+// Setup: SAS endpoint URL = <web app /exec URL>?src=sas , Auth = None.
+function handleSasDebug(ss, e) {
+  try {
+    const sheet = getOrCreateSheet(ss, "SAS Debug");
+    if (sheet.getLastRow() === 0) {
+      sheet.appendRow(["Received At", "Content-Type", "Raw Body", "Params (JSON)", "Query String"]);
+      sheet.getRange("1:1").setFontWeight("bold");
+    }
+    const ctype = (e && e.postData && e.postData.type) ? e.postData.type : "";
+    const raw = (e && e.postData && e.postData.contents) ? String(e.postData.contents) : "";
+    const params = (e && e.parameter) ? JSON.stringify(e.parameter) : "{}";
+    const qs = (e && e.queryString) ? String(e.queryString) : "";
+    sheet.appendRow([new Date(), ctype, raw.substring(0, 45000), params.substring(0, 45000), qs]);
+  } catch (err) {
+    Logger.log("SAS debug capture error: " + err);
+  }
+  return ContentService.createTextOutput(JSON.stringify({ status: "ok" }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// Manual test: simulates a SAS Custom Action POST internally so you can confirm the handler and
+// the "SAS Debug" tab work WITHOUT waiting for SAS to fire. Run from the editor, then look for
+// the SAS Debug tab. If a test row appears, our side is good and we are only waiting on SAS.
+function testSasCapture() {
+  const ss = SpreadsheetApp.openById("1db-1Zlny6ryoAYc4CCkjXPtgXyGCGBEgWBfg5xnq7rU");
+  const fakeE = {
+    parameter: { src: "sas" },
+    queryString: "src=sas",
+    postData: { type: "application/json", contents: JSON.stringify({ test: true, note: "manual testSasCapture row", outcome: "Service Inquiry", caller: "555-0100" }) },
+  };
+  handleSasDebug(ss, fakeE);
+  Logger.log("testSasCapture: wrote a test row to the 'SAS Debug' tab. Open the spreadsheet to confirm.");
 }
 
 // --- INSTAGRAM DM WEBHOOK HANDLER ---
@@ -5730,9 +5814,10 @@ function sendDailyRecap(recipientOverride, skipSave) {
         </td>
       </tr></table>`;
 
-  // ── DAILY THEMES (AI-powered) — shown first, right after health badges ──
+  // ── DAILY THEMES (AI-powered) — captured here, appended LAST (before footer) ──
+  let dailyThemeSectionHtml = "";
   if (dailyThemesHtml) {
-    html += `
+    dailyThemeSectionHtml = `
       <div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
         <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">AI Recap - Today's Top Themes</h2>
         <div style="font-size:13px;line-height:1.6;color:#1D1D1D;">${dailyThemesHtml}</div>
@@ -5903,12 +5988,15 @@ function sendDailyRecap(recipientOverride, skipSave) {
       </div>`;
   }
 
-  // (Daily themes block moved to top of email — see above)
+  // (Daily themes appended below, just before the footer)
 
   // ── TOKEN WARNING ──
   if (meta.tokenWarning) {
     html += `<div style="background:#FFF3CD;border:1px solid #FFE69C;border-radius:6px;padding:12px 16px;margin-bottom:16px;font-size:13px;color:#856404;">Warning: ${meta.tokenWarning}</div>`;
   }
+
+  // ── End of Day Summary THEME ANALYSIS — appended LAST (final content block) ──
+  html += dailyThemeSectionHtml;
 
   // Footer with health status definitions
   html += `
@@ -5920,7 +6008,7 @@ function sendDailyRecap(recipientOverride, skipSave) {
         <div style="margin-bottom:4px;">The "${compLabel}" column shows the previous working day's end-of-day values for comparison.</div>
       </div>
       <div style="text-align:center;padding:8px 0;font-size:11px;color:#999;">
-        CS Visibility · AI Recap v2.5.4 · End of Day Summary · ${dateStr}
+        CS Visibility · AI Recap v2.5.64 · End of Day Summary · ${dateStr}
       </div>
     </div>
   </div>`;
@@ -6024,6 +6112,25 @@ function sendDailyRecap(recipientOverride, skipSave) {
     Logger.log("Test mode — skipped saving snapshot and metrics log");
   }
 
+  // ── Compute FRT/Resolution for today's solved tickets ──
+  let todayResponseMetrics = { medianFrt: "", avgFrt: "", medianResolution: "", avgResolution: "" };
+  try {
+    const todaySolvedIds = (zendesk.tickets || []).filter(t => {
+      if ((t.tags || []).includes("aircall")) return false;
+      if ((t.tags || []).includes("internal__testing")) return false;
+      if ((t.tags || []).includes("auto_close")) return false;
+      return true;
+    }).map(t => t.id);
+    if (todaySolvedIds.length > 0) {
+      const zdToken = PropertiesService.getScriptProperties().getProperty("ZENDESK_TOKEN");
+      const zdAuth = "Basic " + Utilities.base64Encode(zdToken);
+      const zdMetricOpts = { method: "get", headers: { "Authorization": zdAuth, "Content-Type": "application/json" }, muteHttpExceptions: true };
+      todayResponseMetrics = fetchTicketResponseMetrics(todaySolvedIds, zdMetricOpts, CONFIG.zendesk.subdomain);
+    }
+  } catch (e) {
+    Logger.log("FRT/Resolution compute failed (non-fatal): " + e);
+  }
+
   // ── Append to Daily Metrics Log sheet (powers weekly/monthly summaries) ──
   if (!skipSave) {
   logDailyMetrics({
@@ -6059,10 +6166,28 @@ function sendDailyRecap(recipientOverride, skipSave) {
     agentEmailCsatTot: CONFIG.agents.map(a => recapAgentEmailCsat[a].total),
     agentPhoneCsatSat: CONFIG.agents.map(a => recapAgentPhoneCsat[a].satisfied),
     agentPhoneCsatTot: CONFIG.agents.map(a => recapAgentPhoneCsat[a].total),
+    medianFrt: todayResponseMetrics.medianFrt,
+    avgFrt: todayResponseMetrics.avgFrt,
+    medianResolution: todayResponseMetrics.medianResolution,
+    avgResolution: todayResponseMetrics.avgResolution,
+    emailNps: "",
+    phoneNps: "",
+    ces: "",
     unreadDMs: metaUnread,
     smsInbound: sms.inbound || 0,
     smsOutbound: sms.outbound || 0,
   });
+
+  // Keep the per-agent "Emails:" columns current: capture today's agent reply counts and write
+  // them onto today's just-logged row. Reuses pullEmailWork + writeEmailWorkToLog_. A single day
+  // is only 1-3 incremental pages and this runs once per day, so the rate limit is a non-issue.
+  try {
+    const emailDay = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+    const wrote = writeEmailWorkToLog_(pullEmailWork(emailDay, emailDay));
+    Logger.log("Daily email-work captured for " + emailDay + " (" + wrote + " cells).");
+  } catch (eEmail) {
+    Logger.log("Daily email-work capture failed (non-fatal): " + eEmail);
+  }
   } // end if (!skipSave)
 
   // Update Health Trends tab (historical chart of health statuses)
@@ -6091,7 +6216,7 @@ const METRICS_LOG_HEADERS = [
   "SAS Tickets", "Open Voicemails", "AI Agent Tickets",
   "Tickets Created", "Solved Total",
   // Per-agent solved columns are dynamically named from CONFIG.agents
-  // e.g. "Solved: AgentA", "Solved: AgentB", "Solved: AgentC"
+  // e.g. "Solved: <FirstName>" for each agent
   ...CONFIG.agents.map(a => "Solved: " + a.split(" ")[0]),
   "Answer Rate %", "Inbound Calls", "Forwarded to SAS", "Outbound Calls",
   "Avg Wait (sec)", "Avg Duration (sec)",
@@ -6108,8 +6233,20 @@ const METRICS_LOG_HEADERS = [
   ...CONFIG.agents.map(a => "Email CSAT Tot: " + a.split(" ")[0]),
   ...CONFIG.agents.map(a => "Phone CSAT Sat: " + a.split(" ")[0]),
   ...CONFIG.agents.map(a => "Phone CSAT Tot: " + a.split(" ")[0]),
+  "Median FRT (biz hrs)", "Avg FRT (biz hrs)", "Median Resolution (biz hrs)", "Avg Resolution (biz hrs)",
+  "Email NPS", "Phone NPS", "CES",
   "Unread DMs", "SMS Inbound", "SMS Outbound",
 ];
+
+function repairMetricsLogHeaders() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Daily Metrics Log");
+  if (!sheet) { Logger.log("No Daily Metrics Log sheet found"); return; }
+  sheet.getRange(1, 1, 1, METRICS_LOG_HEADERS.length).setValues([METRICS_LOG_HEADERS]);
+  sheet.getRange(1, 1, 1, METRICS_LOG_HEADERS.length)
+    .setFontWeight("bold").setFontSize(9).setBackground("#E1DFDD");
+  Logger.log("Repaired headers: " + METRICS_LOG_HEADERS.length + " columns written");
+}
 
 function getOrCreateMetricsLog() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -6180,6 +6317,13 @@ function logDailyMetrics(m) {
     ...(m.agentEmailCsatTot || CONFIG.agents.map(() => 0)),
     ...(m.agentPhoneCsatSat || CONFIG.agents.map(() => 0)),
     ...(m.agentPhoneCsatTot || CONFIG.agents.map(() => 0)),
+    m.medianFrt !== undefined ? m.medianFrt : "",
+    m.avgFrt !== undefined ? m.avgFrt : "",
+    m.medianResolution !== undefined ? m.medianResolution : "",
+    m.avgResolution !== undefined ? m.avgResolution : "",
+    m.emailNps !== undefined ? m.emailNps : "",
+    m.phoneNps !== undefined ? m.phoneNps : "",
+    m.ces !== undefined ? m.ces : "",
     m.unreadDMs,
     m.smsInbound,
     m.smsOutbound,
@@ -6225,15 +6369,36 @@ function aggregateMetrics(rows) {
   if (rows.length === 0) return null;
   const n = rows.length;
 
-  function avg(key) {
-    const vals = rows.map(r => Number(r[key]) || 0);
-    return vals.reduce((a, b) => a + b, 0) / n;
-  }
+  // Separate working days from weekends/holidays for accurate averages
+  const holidays = getDeakoHolidays();
+  const tz = CONFIG.businessHours.timezone;
+  const workingRows = rows.filter(r => {
+    // Use _dateStr (normalized yyyy-MM-dd) if available, otherwise try to parse Date field
+    let dateStr = r._dateStr || "";
+    if (!dateStr) {
+      const raw = r["Date"];
+      if (raw instanceof Date) {
+        dateStr = Utilities.formatDate(raw, tz, "yyyy-MM-dd");
+      } else {
+        dateStr = String(raw || "").substring(0, 10);
+      }
+    }
+    if (!dateStr || dateStr.length < 10) return true; // fallback: count as working
+    const dt = new Date(dateStr + "T12:00:00");
+    return !isNonWorkingDay(dt, holidays);
+  });
+  const wd = workingRows.length || 1; // working days (avoid division by zero)
+
   function sum(key) {
     return rows.map(r => Number(r[key]) || 0).reduce((a, b) => a + b, 0);
   }
   function avgNonEmpty(key) {
-    const vals = rows.map(r => r[key]).filter(v => v !== "" && v !== null && v !== undefined).map(Number);
+    const vals = rows.map(r => r[key]).filter(v => v !== "" && v !== null && v !== undefined).map(Number).filter(v => !isNaN(v));
+    return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  }
+  // Average only across working days that have data for this key
+  function avgWorkingNonEmpty(key) {
+    const vals = workingRows.map(r => r[key]).filter(v => v !== "" && v !== null && v !== undefined).map(Number).filter(v => !isNaN(v));
     return vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   }
   function countNonEmpty(key) {
@@ -6241,26 +6406,34 @@ function aggregateMetrics(rows) {
   }
 
   return {
-    days: n,
-    // Queue-state metrics use avgNonEmpty because backfilled rows have blank values
-    // (these are live snapshots that can't be reconstructed historically)
-    queueStateDays: countNonEmpty("Open Tickets"), // how many days have live queue data
-    avgOpenTickets: avgNonEmpty("Open Tickets") !== null ? Math.round(avgNonEmpty("Open Tickets") * 10) / 10 : null,
-    avgUnassigned: avgNonEmpty("Unassigned") !== null ? Math.round(avgNonEmpty("Unassigned") * 10) / 10 : null,
-    avgOnHold: avgNonEmpty("On Hold") !== null ? Math.round(avgNonEmpty("On Hold") * 10) / 10 : null,
-    avgPastSla: avgNonEmpty("Past SLA") !== null ? Math.round(avgNonEmpty("Past SLA") * 10) / 10 : null,
-    avgVoicemails: avgNonEmpty("Open Voicemails") !== null ? Math.round(avgNonEmpty("Open Voicemails") * 10) / 10 : null,
+    days: wd, // working days only (used for display: "20 working days")
+    totalDays: n, // all days including weekends (for reference)
+    // Queue-state metrics: average only across working days with data
+    queueStateDays: countNonEmpty("Open Tickets"),
+    avgOpenTickets: avgWorkingNonEmpty("Open Tickets") !== null ? Math.round(avgWorkingNonEmpty("Open Tickets") * 10) / 10 : null,
+    avgUnassigned: avgWorkingNonEmpty("Unassigned") !== null ? Math.round(avgWorkingNonEmpty("Unassigned") * 10) / 10 : null,
+    avgOnHold: avgWorkingNonEmpty("On Hold") !== null ? Math.round(avgWorkingNonEmpty("On Hold") * 10) / 10 : null,
+    avgPastSla: avgWorkingNonEmpty("Past SLA") !== null ? Math.round(avgWorkingNonEmpty("Past SLA") * 10) / 10 : null,
+    avgVoicemails: avgWorkingNonEmpty("Open Voicemails") !== null ? Math.round(avgWorkingNonEmpty("Open Voicemails") * 10) / 10 : null,
+    // Volume: sum ALL days (tickets get created on weekends too)
     totalCreated: sum("Tickets Created"),
     totalSolved: sum("Solved Total"),
     agentSolved: CONFIG.agents.map(a => ({
       name: a,
       total: sum("Solved: " + a.split(" ")[0]),
     })),
-    avgAnswerRate: Math.round(avg("Answer Rate %")),
+    // Phone: average answer rate across working days only (no phones on weekends)
+    avgAnswerRate: (() => {
+      const vals = workingRows.map(r => r["Answer Rate %"]).filter(v => v !== "" && v !== null && v !== undefined).map(Number).filter(v => !isNaN(v) && v > 0);
+      return vals.length > 0 ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+    })(),
     totalInbound: sum("Inbound Calls"),
     totalForwarded: sum("Forwarded to SAS"),
     totalOutbound: sum("Outbound Calls"),
-    avgWaitTime: Math.round(avg("Avg Wait (sec)")),
+    avgWaitTime: (() => {
+      const vals = workingRows.map(r => Number(r["Avg Wait (sec)"]) || 0).filter(v => v > 0);
+      return vals.length > 0 ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+    })(),
     agentInbound: CONFIG.agents.map(a => ({
       name: a,
       total: sum("In: " + a.split(" ")[0]),
@@ -6277,12 +6450,25 @@ function aggregateMetrics(rows) {
       name: a,
       total: sum("Out Talk: " + a.split(" ")[0]),
     })),
+    // FRT/Resolution: average across working days only (no tickets solved on weekends typically)
+    medianFrt: avgWorkingNonEmpty("Median FRT (biz hrs)") !== null ? Math.round(avgWorkingNonEmpty("Median FRT (biz hrs)") * 10) / 10 : null,
+    avgFrt: avgWorkingNonEmpty("Avg FRT (biz hrs)") !== null ? Math.round(avgWorkingNonEmpty("Avg FRT (biz hrs)") * 10) / 10 : null,
+    medianResolution: avgWorkingNonEmpty("Median Resolution (biz hrs)") !== null ? Math.round(avgWorkingNonEmpty("Median Resolution (biz hrs)") * 10) / 10 : null,
+    avgResolution: avgWorkingNonEmpty("Avg Resolution (biz hrs)") !== null ? Math.round(avgWorkingNonEmpty("Avg Resolution (biz hrs)") * 10) / 10 : null,
+    emailNps: avgNonEmpty("Email NPS"),
+    phoneNps: avgNonEmpty("Phone NPS"),
+    ces: avgNonEmpty("CES"),
+    // CSAT: average across all days that have data (reviews can come in on weekends)
     avgCsatPct: avgNonEmpty("Email CSAT %"),
     totalCsatResponses: sum("Email CSAT Responses"),
     totalCsatSatisfied: sum("Email CSAT Satisfied"),
     avgPhoneCsatPct: avgNonEmpty("Phone CSAT %"),
     totalPhoneCsatResponses: sum("Phone CSAT Responses"),
-    avgUnreadDMs: Math.round(avg("Unread DMs") * 10) / 10,
+    // Social/SMS: average across all days
+    avgUnreadDMs: (() => {
+      const vals = rows.map(r => r["Unread DMs"]).filter(v => v !== "" && v !== null && v !== undefined).map(Number).filter(v => !isNaN(v));
+      return vals.length > 0 ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length * 10) / 10 : 0;
+    })(),
     totalSmsInbound: sum("SMS Inbound"),
     totalSmsOutbound: sum("SMS Outbound"),
   };
@@ -6645,11 +6831,11 @@ ALL POSITIVE COMMENTS THIS WEEK:
 ${commentList}
 
 Pick:
-1. ONE best overall experience quote (warm, specific, representative of great service -- not about a specific agent)
+1. ONE best overall experience quote (warm, specific, representative of great service -- not about a specific agent, and different from the per-agent quotes you pick below)
 2. Up to ONE quote per agent that specifically praises them (skip agents with no good quotes)
 
 Return valid JSON only:
-{"general": {"index": 0, "quote": "the comment"}, "agents": {"AgentA": {"index": 1, "quote": "the comment"}, "AgentB": {"index": 2, "quote": "the comment"}}}
+{"general": {"index": 0, "quote": "the comment"}, "agents": {"<AgentFirstName1>": {"index": 1, "quote": "the comment"}, "<AgentFirstName2>": {"index": 2, "quote": "the comment"}}}
 
 If no good general quote exists, set general to null. If an agent has no praiseworthy comment, omit them from agents. Prefer specific, descriptive praise over generic "great service" comments.` }],
       }),
@@ -6675,23 +6861,26 @@ If no good general quote exists, set general to null. If an agent has no praisew
     let html = `<div style="background:#F0F7F0;border:1px solid #C8E6C9;border-radius:6px;padding:16px;margin-bottom:16px;">
       <h2 style="margin:0 0 10px;font-size:15px;color:#2E7D32;">Customer Kudos</h2>`;
 
+    // De-dupe: the LLM sometimes picks the same comment for the general highlight and an agent.
+    const seenQuotes = new Set();
+    const normQuote = (q) => String(q).replace(/\s+/g, " ").trim().toLowerCase();
+
     // General highlight
     if (picks.general && picks.general.quote) {
       const escaped = picks.general.quote.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       html += `<div style="font-size:13px;color:#333;font-style:italic;border-left:3px solid #2E7D32;padding-left:10px;margin-bottom:12px;">"${escaped}"</div>`;
+      seenQuotes.add(normQuote(picks.general.quote));
     }
 
-    // Per-agent highlights
+    // Per-agent highlights (skip any quote already shown, e.g. the general/featured one)
     if (picks.agents) {
-      const agentEntries = Object.entries(picks.agents);
-      if (agentEntries.length > 0) {
-        agentEntries.forEach(([name, c]) => {
-          if (c && c.quote) {
-            const escaped = c.quote.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-            html += `<div style="font-size:12px;color:#555;margin-bottom:6px;"><strong>${name}:</strong> <span style="font-style:italic;">"${escaped}"</span></div>`;
-          }
-        });
-      }
+      Object.entries(picks.agents).forEach(([name, c]) => {
+        if (c && c.quote && !seenQuotes.has(normQuote(c.quote))) {
+          const escaped = c.quote.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+          html += `<div style="font-size:12px;color:#555;margin-bottom:6px;"><strong>${name}:</strong> <span style="font-style:italic;">"${escaped}"</span></div>`;
+          seenQuotes.add(normQuote(c.quote));
+        }
+      });
     }
 
     html += `</div>`;
@@ -6707,7 +6896,7 @@ If no good general quote exists, set general to null. If an agent has no praisew
 }
 
 // ─── WEEKLY SUMMARY EMAIL ───
-// Triggered daily at 6:15pm — only sends on the last working day of the week.
+// Triggered daily at 7:15pm (after the 6pm daily recap logs today's row) — only sends on the last working day of the week.
 function checkAndSendWeeklySummary() {
   loadThresholds();
   const tz = CONFIG.businessHours.timezone;
@@ -6824,11 +7013,12 @@ function sendWeeklySummary(now, tz, recipientOverride) {
     Logger.log("Health trends in weekly email failed (non-fatal): " + e.toString());
   }
 
-  // ── 2. AI RECAP — WEEKLY THEME TRENDS ──
+  // ── AI RECAP — WEEKLY THEME TRENDS (captured here, appended LAST) ──
+  let weeklyThemeHtml = "";
   try {
     const trendHtml = analyzeThemeTrends(thisWeek.start, thisWeek.end, "Week of " + weekLabel);
     if (trendHtml) {
-      html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+      weeklyThemeHtml = `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
         <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">AI Recap - Weekly Theme Trends</h2>
         <div style="font-size:13px;line-height:1.6;">${trendHtml}</div>
         <div style="margin-top:10px;font-size:10px;color:#999;">Analysis powered by Claude AI across all tickets and call intents</div>
@@ -6853,7 +7043,11 @@ function sendWeeklySummary(now, tz, recipientOverride) {
       <tr><td style="${colLabel}">Tickets Solved</td><td style="${colThis}font-weight:bold;">${curr.totalSolved}</td>${prevCell(curr.totalSolved, prev ? prev.totalSolved : null, "")}</tr>
       <tr><td style="${colLabel}">Avg Open Tickets</td><td style="${colThis}font-weight:bold;">${curr.avgOpenTickets !== null ? curr.avgOpenTickets : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgOpenTickets, prev && prev.queueStateDays >= Math.ceil(prev.days / 2) ? prev.avgOpenTickets : null, "")}</tr>
       <tr><td style="${colLabel}">Avg Past SLA</td><td style="${colThis}font-weight:bold;${curr.avgPastSla !== null && curr.avgPastSla > 0 ? 'color:#C62828;' : ''}">${curr.avgPastSla !== null ? curr.avgPastSla : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgPastSla, prev && prev.queueStateDays >= Math.ceil(prev.days / 2) ? prev.avgPastSla : null, "")}</tr>
-      <tr><td style="${colLabel}">Avg Unassigned</td><td style="${colThis}font-weight:bold;">${curr.avgUnassigned !== null ? curr.avgUnassigned : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgUnassigned, prev && prev.queueStateDays >= Math.ceil(prev.days / 2) ? prev.avgUnassigned : null, "")}</tr>`;
+      <tr><td style="${colLabel}">Avg Unassigned</td><td style="${colThis}font-weight:bold;">${curr.avgUnassigned !== null ? curr.avgUnassigned : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgUnassigned, prev && prev.queueStateDays >= Math.ceil(prev.days / 2) ? prev.avgUnassigned : null, "")}</tr>
+      <tr><td style="${colLabel}">Median First Response</td><td style="${colThis}font-weight:bold;">${curr.medianFrt !== null ? curr.medianFrt + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.medianFrt, prev && prev.medianFrt ? prev.medianFrt : null, "h")}</tr>
+      <tr><td style="${colLabel}">Avg First Response</td><td style="${colThis}font-weight:bold;">${curr.avgFrt !== null ? curr.avgFrt + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgFrt, prev && prev.avgFrt ? prev.avgFrt : null, "h")}</tr>
+      <tr><td style="${colLabel}">Median Resolution</td><td style="${colThis}font-weight:bold;">${curr.medianResolution !== null ? curr.medianResolution + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.medianResolution, prev && prev.medianResolution ? prev.medianResolution : null, "h")}</tr>
+      <tr><td style="${colLabel}">Avg Resolution</td><td style="${colThis}font-weight:bold;">${curr.avgResolution !== null ? curr.avgResolution + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgResolution, prev && prev.avgResolution ? prev.avgResolution : null, "h")}</tr>`;
 
   html += `</table>`;
 
@@ -6956,6 +7150,9 @@ function sendWeeklySummary(now, tz, recipientOverride) {
       <tr><td style="${colLabel}">Total In/Out</td><td style="${colThis}font-weight:bold;">${curr.totalSmsInbound} / ${curr.totalSmsOutbound}</td>${prev ? `<td style="${colPrev}">${prev.totalSmsInbound} / ${prev.totalSmsOutbound}</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>
     </table></div>`;
 
+  // ── Weekly Summary THEME ANALYSIS — appended LAST (final content block) ──
+  html += weeklyThemeHtml;
+
   // Footer with health status definitions
   const th = CONFIG.thresholds;
   const slaHours = th.oldestUnanswered.green;
@@ -6967,7 +7164,7 @@ function sendWeeklySummary(now, tz, recipientOverride) {
         <div style="margin-bottom:4px;">Social: Healthy = oldest unread DM under ${th.socialResponseTime.green / 60}h · Watch = ${th.socialResponseTime.green / 60}-${th.socialResponseTime.yellow / 60}h · At Risk = over ${th.socialResponseTime.yellow / 60}h</div>
       </div>`;
   html += `<div style="text-align:center;font-size:11px;color:#999;padding-top:8px;">
-      CS Visibility · AI Recap v2.5.4 · Weekly Summary · ${weekLabel}
+      CS Visibility · AI Recap v2.5.64 · Weekly Summary · ${weekLabel}
       ${prev ? '<br>Comparison: ' + prevWeekLabel : '<br>No prior week data available for comparison'}
     </div>
     </div>
@@ -7067,14 +7264,15 @@ function sendMonthlySummary(now, tz, recipientOverride) {
     Logger.log("Health trends in monthly email failed (non-fatal): " + e.toString());
   }
 
-  // ── AI RECAP — MONTHLY TREND ANALYSIS ──
+  // ── AI RECAP — MONTHLY TREND ANALYSIS (captured here, appended LAST) ──
+  let monthlyThemeHtml = "";
   try {
     const mStart = thisYear + "-" + String(thisMonth).padStart(2, "0") + "-01";
     const mEndDay = new Date(thisYear, thisMonth, 0).getDate();
     const mEnd = thisYear + "-" + String(thisMonth).padStart(2, "0") + "-" + String(mEndDay).padStart(2, "0");
     const trendHtml = analyzeThemeTrends(mStart, mEnd, monthLabel);
     if (trendHtml) {
-      html += `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
+      monthlyThemeHtml = `<div style="background:${cardBg};border:1px solid ${borderColor};border-radius:6px;padding:16px;margin-bottom:16px;">
         <h2 style="margin:0 0 12px;font-size:15px;color:${navy};">AI Recap - Monthly Theme Trends</h2>
         <div style="font-size:13px;line-height:1.6;">${trendHtml}</div>
         <div style="margin-top:10px;font-size:10px;color:#999;">Analysis powered by Claude AI across all tickets and call intents</div>
@@ -7147,6 +7345,10 @@ function sendMonthlySummary(now, tz, recipientOverride) {
       <tr><td style="${colLabel}">Avg Daily Open Tickets</td><td style="${colThis}font-weight:bold;">${curr.avgOpenTickets !== null ? curr.avgOpenTickets : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgOpenTickets, prev ? prev.avgOpenTickets : null)}</tr>
       <tr><td style="${colLabel}">Avg Daily Past SLA</td><td style="${colThis}font-weight:bold;${curr.avgPastSla !== null && curr.avgPastSla > 0 ? 'color:#C62828;' : ''}">${curr.avgPastSla !== null ? curr.avgPastSla : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgPastSla, prev ? prev.avgPastSla : null)}</tr>
       <tr><td style="${colLabel}">Avg Daily Unassigned</td><td style="${colThis}font-weight:bold;">${curr.avgUnassigned !== null ? curr.avgUnassigned : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgUnassigned, prev ? prev.avgUnassigned : null)}</tr>
+      <tr><td style="${colLabel}">Median First Response</td><td style="${colThis}font-weight:bold;">${curr.medianFrt !== null ? curr.medianFrt + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.medianFrt, prev && prev.medianFrt ? prev.medianFrt : null, "h")}</tr>
+      <tr><td style="${colLabel}">Avg First Response</td><td style="${colThis}font-weight:bold;">${curr.avgFrt !== null ? curr.avgFrt + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgFrt, prev && prev.avgFrt ? prev.avgFrt : null, "h")}</tr>
+      <tr><td style="${colLabel}">Median Resolution</td><td style="${colThis}font-weight:bold;">${curr.medianResolution !== null ? curr.medianResolution + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.medianResolution, prev && prev.medianResolution ? prev.medianResolution : null, "h")}</tr>
+      <tr><td style="${colLabel}">Avg Resolution</td><td style="${colThis}font-weight:bold;">${curr.avgResolution !== null ? curr.avgResolution + 'h' : '<span style="color:#AAA;font-weight:normal;">no data</span>'}</td>${prevCell(curr.avgResolution, prev && prev.avgResolution ? prev.avgResolution : null, "h")}</tr>
       <tr><td style="${colLabel}">Avg Solved/Day</td><td style="${colThis}font-weight:bold;">${(curr.totalSolved / curr.days).toFixed(1)}</td>${prev ? `<td style="${colPrev}">${(prev.totalSolved / prev.days).toFixed(1)}</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>`;
 
   html += `</table>`;
@@ -7250,6 +7452,9 @@ function sendMonthlySummary(now, tz, recipientOverride) {
       <tr><td style="${colLabel}">Total In/Out</td><td style="${colThis}font-weight:bold;">${curr.totalSmsInbound} / ${curr.totalSmsOutbound}</td>${prev ? `<td style="${colPrev}">${prev.totalSmsInbound} / ${prev.totalSmsOutbound}</td>` : `<td style="${colPrev}">${noData}</td>`}</tr>
     </table></div>`;
 
+  // ── Monthly Summary THEME ANALYSIS — appended LAST (final content block) ──
+  html += monthlyThemeHtml;
+
   // Footer with health status definitions
   const th = CONFIG.thresholds;
   const slaHours = th.oldestUnanswered.green;
@@ -7261,7 +7466,7 @@ function sendMonthlySummary(now, tz, recipientOverride) {
         <div style="margin-bottom:4px;">Social: Healthy = oldest unread DM under ${th.socialResponseTime.green / 60}h · Watch = ${th.socialResponseTime.green / 60}-${th.socialResponseTime.yellow / 60}h · At Risk = over ${th.socialResponseTime.yellow / 60}h</div>
       </div>`;
   html += `<div style="text-align:center;font-size:11px;color:#999;padding-top:8px;">
-      CS Visibility · AI Recap v2.5.4 · Monthly Summary · ${monthLabel}
+      CS Visibility · AI Recap v2.5.64 · Monthly Summary · ${monthLabel}
       ${prev ? '<br>Comparison: ' + prevMonthLabel + ' (' + prev.days + ' working days)' : '<br>No prior month data available for comparison'}
     </div>
     </div>
@@ -7306,7 +7511,7 @@ function testMonthlySummary() {
 // 2. Share each sheet with the agent (Viewer) and the script's
 //    service account or your email (Editor)
 // 3. Add Script Property AGENT_SHEETS as JSON:
-//    {"Agent A":"SPREADSHEET_ID","Agent B":"SPREADSHEET_ID","Agent C":"SPREADSHEET_ID"}
+//    {"Jane Doe":"SPREADSHEET_ID","John Roe":"SPREADSHEET_ID"}
 // ═══════════════════════════════════════════════════════════
 
 function updateAgentDashboards(zendesk, aircall, csat, postCall) {
@@ -7534,22 +7739,30 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
 
   const hasLastWeekData = lwRows.length > 0;
 
-  // ─── Write each agent's sheet ───
-  agents.forEach(agent => {
-    const sheetId = agentSheets[agent];
-    if (!sheetId) return;
+  // ─── Write agent hubs to both standalone sheets AND Command Center tabs ───
+  const mainSS = SpreadsheetApp.getActiveSpreadsheet();
 
-    let ss;
-    try { ss = SpreadsheetApp.openById(sheetId); } catch (e) {
-      Logger.log(`Cannot open sheet for ${agent}: ${e.toString()}`);
-      return;
+  agents.forEach(agent => {
+    // Collect target spreadsheets: always write to main SS, optionally write to standalone
+    const targets = [];  // standalone discrete agent sheets only (Command Center tabs removed - see setupAgentResourcesTab)
+    const sheetId = agentSheets[agent];
+    if (sheetId) {
+      try {
+        const standalone = SpreadsheetApp.openById(sheetId);
+        targets.push({ ss: standalone, label: "standalone" });
+      } catch (e) {
+        Logger.log(`Cannot open standalone sheet for ${agent}: ${e.toString()}`);
+      }
     }
+
+    targets.forEach(target => {
+    const ss = target.ss;
 
     const me = agentMetrics[agent];
     const firstName = agent.split(" ")[0];
     const sheetName = firstName + " - Agent Hub";
 
-    // Clean up old sheet names from previous versions (e.g. "AgentA - Agent Command Center")
+    // Clean up old sheet names from previous versions (e.g. "<FirstName> - Agent Command Center")
     const oldSheetName = firstName + " - Agent Command Center";
     const oldSheet = ss.getSheetByName(oldSheetName);
     if (oldSheet) {
@@ -7597,7 +7810,7 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
 
     sheet.setRowHeight(row, 24);
     sheet.getRange(row, 1, 1, totalCols).merge()
-      .setValue(`${dateStr}  ·  Last updated ${timeStr}`)
+      .setValue(`${dateStr}  ·  Last updated ${timeStr}  ·  Refreshes every 5 min`)
       .setBackground(headerBg).setFontColor(BRAND.airBlueLight)
       .setFontSize(9).setFontStyle("italic").setFontFamily("Arial")
       .setVerticalAlignment("middle").setHorizontalAlignment("center");
@@ -7675,7 +7888,7 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
     colHeaders();
     metricRow("New+Open Assigned Tickets", me.assigned, teamAvg.assigned, "num");
     metricRow("Past SLA", me.pastSla, teamAvg.pastSla, "num", { highlight: "lower" });
-    metricRow("Solved Today", me.solved, teamAvg.solved, "num", { highlight: "higher" });
+    metricRow("Solved Today", me.solved, teamAvg.solved, "num");
 
     // Email CSAT
     const ec = agentEmailCsat[agent];
@@ -7768,10 +7981,10 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
     // ════════════════════════════════════════
     sectionHeader("Phone (Aircall) — Your Activity");
     colHeaders();
-    metricRow("Inbound Answered", me.inbound, teamAvg.inbound, "num", { highlight: "higher" });
-    metricRow("Outbound Calls", me.outbound, teamAvg.outbound, "num", { highlight: "higher" });
-    metricRow("Inbound Talk Time", me.inTalk, teamAvg.inTalk, "talk", { highlight: "higher" });
-    metricRow("Outbound Talk Time", me.outTalk, teamAvg.outTalk, "talk", { highlight: "higher" });
+    metricRow("Inbound Answered", me.inbound, teamAvg.inbound, "num");
+    metricRow("Outbound Calls", me.outbound, teamAvg.outbound, "num");
+    metricRow("Inbound Talk Time", me.inTalk, teamAvg.inTalk, "talk");
+    metricRow("Outbound Talk Time", me.outTalk, teamAvg.outTalk, "talk");
 
     // Phone CSAT
     const pc = agentPhoneCsat[agent];
@@ -7836,7 +8049,8 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
         const scoreColor = c.score >= 4 ? green : (c.score >= 3 ? amber : red);
         sheet.getRange(row, 3).setValue(c.score + "/" + c.maxScore)
           .setFontSize(9).setFontFamily("Arial").setFontWeight("bold").setFontColor(scoreColor).setBackground(bg);
-        const custShort = (c.customer || "").length > 18 ? c.customer.substring(0, 15) + "..." : c.customer;
+        const custRaw = String(c.customer || "Unknown").replace(/^[=+\-@]/, "");
+        const custShort = custRaw.length > 18 ? custRaw.substring(0, 15) + "..." : custRaw;
         sheet.getRange(row, 4).setValue(custShort)
           .setFontSize(9).setFontFamily("Arial").setFontColor(labelFg).setBackground(bg);
         sheet.getRange(row, 5).setValue(c.time || "")
@@ -7875,11 +8089,11 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
       row++;
 
       // Reuse metricRow for last week data
-      metricRow("Tickets Solved", lw.solved, lwTeamAvgs.solved, "num", { highlight: "higher" });
-      metricRow("Inbound Answered", lw.inbound, lwTeamAvgs.inbound, "num", { highlight: "higher" });
-      metricRow("Inbound Talk Time", lw.inTalk, lwTeamAvgs.inTalk, "talk", { highlight: "higher" });
-      metricRow("Outbound Calls", lw.outbound, lwTeamAvgs.outbound, "num", { highlight: "higher" });
-      metricRow("Outbound Talk Time", lw.outTalk, lwTeamAvgs.outTalk, "talk", { highlight: "higher" });
+      metricRow("Tickets Solved", lw.solved, lwTeamAvgs.solved, "num");
+      metricRow("Inbound Answered", lw.inbound, lwTeamAvgs.inbound, "num");
+      metricRow("Inbound Talk Time", lw.inTalk, lwTeamAvgs.inTalk, "talk");
+      metricRow("Outbound Calls", lw.outbound, lwTeamAvgs.outbound, "num");
+      metricRow("Outbound Talk Time", lw.outTalk, lwTeamAvgs.outTalk, "talk");
 
       // Email CSAT for last week
       const lwEcPct = lw.emailCsatTot > 0 ? Math.round(lw.emailCsatSat / lw.emailCsatTot * 100) : null;
@@ -7973,13 +8187,13 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
     const footerRow = maxRow + 1;
     sheet.setRowHeight(footerRow, 22);
     sheet.getRange(footerRow, 1, 1, totalCols).merge()
-      .setValue(`CS Visibility · Agent Hub v2.5.4  ·  ${dateStr}  ·  Team avg = average across ${agents.length} agents`)
+      .setValue(`CS Visibility · Agent Hub v2.5.64  ·  ${dateStr}  ·  Team avg = average across ${agents.length} agents`)
       .setFontColor(dimFg).setFontSize(8).setFontStyle("italic")
       .setHorizontalAlignment("center").setBackground(bg).setFontFamily("Arial");
 
     sheet.setRowHeight(footerRow + 1, 18);
     sheet.getRange(footerRow + 1, 1, 1, totalCols).merge()
-      .setValue("Green = at or above team avg  ·  Red = below team avg")
+      .setValue("Color highlights (green / red) apply to CSAT and SLA only · work volume is shown without color judgment")
       .setFontColor(dimFg).setFontSize(7).setFontStyle("italic")
       .setHorizontalAlignment("center").setBackground(bg).setFontFamily("Arial");
 
@@ -8019,13 +8233,22 @@ function updateAgentDashboards(zendesk, aircall, csat, postCall) {
     dash.setHiddenGridlines(true);
     staging.hideSheet();
 
-    // Ensure the main sheet is the first/active sheet
-    ss.setActiveSheet(dash);
-    ss.moveActiveSheet(1);
+    // Ensure the agent hub sheet is not the first sheet in the main SS
+    if (target.label === "standalone") {
+      ss.setActiveSheet(dash);
+      ss.moveActiveSheet(1);
+    } else {
+      // In main SS, make sure Dashboard tab stays first
+      try {
+        const dashTab = ss.getSheetByName("Dashboard");
+        if (dashTab) { ss.setActiveSheet(dashTab); dashTab.activate(); }
+      } catch (e) { /* ignore */ }
+    }
 
     SpreadsheetApp.flush();
-    Logger.log(`Updated agent dashboard for ${agent}`);
-  });
+    Logger.log(`Updated agent dashboard for ${agent} (${target.label})`);
+    }); // end targets.forEach
+  }); // end agents.forEach
 }
 
 // ─── HEALTH TRENDS TAB ───
@@ -8309,7 +8532,7 @@ function updateHealthTrends() {
   const footerRow = 46; // below all 3 charts + legends
   const footerCols = 10; // cols H (8) through Q (17)
   const footerLines = [
-    `CS Visibility · Command Center v2.5.4  ·  Health Trends  ·  Business days only (Mon-Fri, weekends excluded)`,
+    `CS Visibility · Command Center v2.5.64  ·  Health Trends  ·  Business days only (Mon-Fri, weekends excluded)`,
     `Email: Healthy = 0-5 past SLA, Watch = 6-10 past SLA, At Risk = 11+ past SLA`,
     `Phone: Healthy = answer rate >= ${th.phoneAnswerRate.green}%, Watch = ${th.phoneAnswerRate.yellow}-${th.phoneAnswerRate.green - 1}%, At Risk = < ${th.phoneAnswerRate.yellow}%`,
     `Social: Healthy = oldest unread DM <= ${th.socialResponseTime.green / 60}h, Watch = ${th.socialResponseTime.green / 60}-${th.socialResponseTime.yellow / 60}h, At Risk = > ${th.socialResponseTime.yellow / 60}h`,
@@ -8437,6 +8660,81 @@ function backfillHealthFromEmails() {
 // Pulls "flow" metrics (solved tickets, calls, CSAT) from APIs.
 // "Stock" metrics (open count, unassigned, past SLA) are left blank — can't reconstruct point-in-time.
 //
+// Fetch first reply time and full resolution time for a batch of tickets.
+// Uses Zendesk Ticket Metrics API. Returns { medianFrt, avgFrt, medianResolution, avgResolution } in business hours.
+// Only includes tickets that have valid metric values (excludes tickets with no first reply or unsolved).
+function fetchTicketResponseMetrics(ticketIds, zdOpts, subdomain) {
+  if (!ticketIds || ticketIds.length === 0) return { medianFrt: "", avgFrt: "", medianResolution: "", avgResolution: "" };
+
+  const frtMinutes = [];
+  const resolutionMinutes = [];
+
+  // Fetch in batches of 100 (Zendesk ticket show many endpoint)
+  for (let i = 0; i < ticketIds.length; i += 100) {
+    const batch = ticketIds.slice(i, i + 100);
+    const ids = batch.join(",");
+    try {
+      const url = `https://${subdomain}.zendesk.com/api/v2/tickets/show_many.json?ids=${ids}&include=metric_sets`;
+      const resp = UrlFetchApp.fetch(url, zdOpts);
+      if (resp.getResponseCode() === 200) {
+        const data = JSON.parse(resp.getContentText());
+        const tickets = data.tickets || [];
+        const metricSets = data.metric_sets || [];
+
+        // Build a lookup from ticket_id to metric_set
+        const metricsById = {};
+        metricSets.forEach(ms => {
+          if (ms.ticket_id) metricsById[ms.ticket_id] = ms;
+        });
+
+        tickets.forEach(t => {
+          const ms = metricsById[t.id];
+          if (!ms) return;
+
+          // First reply time in business minutes
+          if (ms.reply_time_in_minutes && ms.reply_time_in_minutes.business !== null && ms.reply_time_in_minutes.business !== undefined && ms.reply_time_in_minutes.business > 0) {
+            frtMinutes.push(ms.reply_time_in_minutes.business);
+          }
+
+          // Full resolution time in business minutes
+          if (ms.full_resolution_time_in_minutes && ms.full_resolution_time_in_minutes.business !== null && ms.full_resolution_time_in_minutes.business !== undefined && ms.full_resolution_time_in_minutes.business > 0) {
+            resolutionMinutes.push(ms.full_resolution_time_in_minutes.business);
+          }
+        });
+      } else {
+        Logger.log("Ticket metrics fetch error: " + resp.getResponseCode());
+      }
+    } catch (e) {
+      Logger.log("Ticket metrics fetch failed: " + e);
+    }
+
+    // Rate limit protection
+    if (i + 100 < ticketIds.length) Utilities.sleep(500);
+  }
+
+  function median(arr) {
+    if (arr.length === 0) return null;
+    const sorted = arr.slice().sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  }
+
+  function average(arr) {
+    if (arr.length === 0) return null;
+    return arr.reduce((a, b) => a + b, 0) / arr.length;
+  }
+
+  // Convert from minutes to business hours, round to 1 decimal
+  const toHours = (mins) => mins !== null ? Math.round(mins / 60 * 10) / 10 : "";
+
+  return {
+    medianFrt: toHours(median(frtMinutes)),
+    avgFrt: toHours(average(frtMinutes)),
+    medianResolution: toHours(median(resolutionMinutes)),
+    avgResolution: toHours(average(resolutionMinutes)),
+  };
+}
+
 // Usage:
 //   1. Set Script Property BACKFILL_START_DATE = "2026-04-01" (or however far back you want)
 //   2. Run setupBackfillTrigger() from the editor — it creates a trigger every 8 minutes
@@ -8453,36 +8751,58 @@ function backfillOneDay() {
     return;
   }
 
-  // Determine the next date to process
-  const nextDate = props.getProperty("BACKFILL_NEXT_DATE") || startDate;
-  const todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
-
-  if (nextDate >= todayStr) {
-    Logger.log("Backfill complete — caught up to today (" + todayStr + ")");
-    props.deleteProperty("BACKFILL_NEXT_DATE");
-    props.deleteProperty("BACKFILL_START_DATE");
-    cleanupBackfillTrigger();
-    return;
-  }
-
-  // Check if this is a non-working day — skip it
-  const dateObj = new Date(nextDate + "T12:00:00");
+  const runStart = new Date();
+  const MAX_RUN_MS = 4.5 * 60 * 1000; // 4.5 minutes max (Apps Script limit is 6 min)
   const holidays = getDeakoHolidays();
-  if (isNonWorkingDay(dateObj, holidays)) {
-    Logger.log("Skipping non-working day: " + nextDate);
-    advanceBackfillDate(props, nextDate);
-    return;
-  }
+  let daysProcessed = 0;
 
-  // Check if already logged
-  const existing = readMetricsLog(nextDate, nextDate);
-  if (existing.length > 0) {
-    Logger.log("Already have data for " + nextDate + " — skipping");
-    advanceBackfillDate(props, nextDate);
-    return;
-  }
+  // Pre-load existing dates into a Set for fast O(1) duplicate detection
+  // This avoids reading the entire sheet on every loop iteration
+  const existingDates = new Set();
+  try {
+    const mlSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Daily Metrics Log");
+    if (mlSheet && mlSheet.getLastRow() > 1) {
+      const dateCol = mlSheet.getRange(2, 1, mlSheet.getLastRow() - 1, 1).getValues();
+      dateCol.forEach(row => {
+        const raw = row[0];
+        if (!raw) return;
+        const ds = raw instanceof Date
+          ? Utilities.formatDate(raw, tz, "yyyy-MM-dd")
+          : String(raw).substring(0, 10);
+        existingDates.add(ds);
+      });
+    }
+  } catch (e) { Logger.log("Could not pre-load existing dates: " + e); }
+  Logger.log("Pre-loaded " + existingDates.size + " existing dates for duplicate detection");
 
-  Logger.log("Backfilling metrics for: " + nextDate);
+  while (true) {
+    // Time guard: stop if we've been running too long
+    if (new Date() - runStart > MAX_RUN_MS) {
+      Logger.log("Time limit reached after " + daysProcessed + " days — will continue next trigger");
+      return;
+    }
+
+    const nextDate = props.getProperty("BACKFILL_NEXT_DATE") || startDate;
+    const todayStr = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+
+    if (nextDate >= todayStr) {
+      Logger.log("Backfill complete — caught up to today (" + todayStr + "). Processed " + daysProcessed + " days this run.");
+      props.deleteProperty("BACKFILL_NEXT_DATE");
+      props.deleteProperty("BACKFILL_START_DATE");
+      cleanupBackfillTrigger();
+      return;
+    }
+
+    // Non-working days are now included (tickets still get created on weekends/holidays)
+    const dateObj = new Date(nextDate + "T12:00:00");
+
+    // Check if already logged — fast Set lookup, no sheet read
+    if (existingDates.has(nextDate)) {
+      advanceBackfillDate(props, nextDate);
+      continue;
+    }
+
+    Logger.log("Backfilling metrics for: " + nextDate);
   const dayOfWeek = Utilities.formatDate(dateObj, tz, "EEEE");
 
   // ── Zendesk: Solved tickets that day ──
@@ -8510,13 +8830,35 @@ function backfillOneDay() {
     zdCount(`type:ticket solved>=${nextDate} solved<${nextDatePlusOne} ${solvedFilter} assignee:"${a}"`)
   );
 
-  // ── Aircall: Calls that day ──
+  // Fetch actual ticket IDs for FRT/Resolution metrics
+  let solvedTicketIds = [];
+  try {
+    let page = 1;
+    let hasMore = true;
+    while (hasMore && page <= 5) {
+      const url = `https://${subdomain}.zendesk.com/api/v2/search.json?query=${encodeURIComponent("type:ticket solved>=" + nextDate + " solved<" + nextDatePlusOne + " " + solvedFilter)}&per_page=100&page=${page}&sort_by=created_at&sort_order=desc`;
+      const resp = UrlFetchApp.fetch(url, zdOpts);
+      if (resp.getResponseCode() === 200) {
+        const data = JSON.parse(resp.getContentText());
+        const results = data.results || [];
+        solvedTicketIds = solvedTicketIds.concat(results.map(t => t.id));
+        hasMore = results.length === 100;
+        page++;
+      } else { hasMore = false; }
+    }
+  } catch (e) { Logger.log("Ticket ID fetch error: " + e); }
+
+  const responseMetrics = fetchTicketResponseMetrics(solvedTicketIds, zdOpts, subdomain);
+
+  // ── Aircall: Calls + SMS that day ──
   let inboundCalls = 0;
   let forwardedToSAS = 0;
   let outboundCalls = 0;
   let answeredCalls = 0;
   let avgWaitTime = 0;
   let avgDuration = 0;
+  let smsInbound = 0;
+  let smsOutbound = 0;
   const agentIn = CONFIG.agents.map(() => 0);
   const agentOut = CONFIG.agents.map(() => 0);
   const agentInTalk = CONFIG.agents.map(() => 0);
@@ -8578,7 +8920,17 @@ function backfillOneDay() {
       forwardedToSAS = supportCalls.filter(c => {
         if (c.direction !== "outbound") return false;
         const rd = (c.raw_digits || "").replace(/[\s\-\(\)]/g, "");
-        return answerSvcNum && rd.includes(answerSvcNum.replace("+1", ""));
+        if (!(answerSvcNum && rd.includes(answerSvcNum.replace("+1", "")))) return false;
+        // Business-hours filter (mirror the inbound side + live calc): exclude SAS
+        // forwards outside Mon-Fri 6a-5p Pacific so after-hours forwards don't inflate
+        // the denominator and depress the historical answer rate on working days.
+        if (!c.started_at) return false;
+        const cd = new Date(c.started_at * 1000);
+        const ps = cd.toLocaleString("en-US", { timeZone: bh.timezone });
+        const pd = new Date(ps);
+        const dow = pd.getDay();
+        const hr = pd.getHours();
+        return bh.workDays.includes(dow) && hr >= bh.startHour && hr < bh.endHour;
       }).length;
 
       // Outbound (all lines, CS agents only, exclude SAS)
@@ -8643,6 +8995,54 @@ function backfillOneDay() {
       inboundCalls = answeredCalls;
       // Store answer rate in a variable we can use below
       var computedAnswerRate = answerRate;
+
+      // ── SMS/Text Messages for this day ──
+      try {
+        // Aircall messages endpoint: GET /v1/calls with direction filter won't work for SMS
+        // Instead, check all numbers for messages using the number-specific endpoint
+        const numberIds = [];
+        // First get all number IDs
+        const numResp = UrlFetchApp.fetch(`${baseUrl}/numbers?per_page=50`, { method: "get", headers: { "Authorization": auth }, muteHttpExceptions: true });
+        if (numResp.getResponseCode() === 200) {
+          const numData = JSON.parse(numResp.getContentText());
+          (numData.numbers || []).forEach(num => {
+            if (num.id) numberIds.push(num.id);
+          });
+        }
+
+        const excludeLines = CONFIG.excludeSMSLines || [];
+        numberIds.forEach(numId => {
+          try {
+            let msgPage = 1;
+            let msgMore = true;
+            while (msgMore && msgPage <= 5) {
+              const msgUrl = `${baseUrl}/numbers/${numId}/messages?from=${fromTs}&to=${toTs}&per_page=50&page=${msgPage}&order=desc`;
+              const msgResp = UrlFetchApp.fetch(msgUrl, { method: "get", headers: { "Authorization": auth }, muteHttpExceptions: true });
+              if (msgResp.getResponseCode() !== 200) break;
+              const msgData = JSON.parse(msgResp.getContentText());
+              const messages = msgData.messages || [];
+              if (messages.length === 0) break;
+
+              messages.forEach(m => {
+                // Skip excluded lines
+                const lineName = (m.number && m.number.name) || "";
+                if (excludeLines.some(ex => lineName.toLowerCase() === ex.toLowerCase())) return;
+
+                if (m.direction === "inbound") {
+                  smsInbound++;
+                } else if (m.direction === "outbound") {
+                  smsOutbound++;
+                }
+              });
+
+              msgMore = messages.length === 50;
+              msgPage++;
+            }
+          } catch (me) { /* skip this number */ }
+        });
+      } catch (smsErr) {
+        Logger.log("SMS backfill error for " + nextDate + ": " + smsErr);
+      }
     }
   } catch (e) {
     Logger.log("Aircall backfill error: " + e);
@@ -8802,13 +9202,24 @@ function backfillOneDay() {
     agentEmailCsatTot: bfAgentEmailCsatTot,
     agentPhoneCsatSat: bfAgentPhoneCsatSat,
     agentPhoneCsatTot: bfAgentPhoneCsatTot,
+    medianFrt: responseMetrics.medianFrt,
+    avgFrt: responseMetrics.avgFrt,
+    medianResolution: responseMetrics.medianResolution,
+    avgResolution: responseMetrics.avgResolution,
+    emailNps: "",
+    phoneNps: "",
+    ces: "",
     unreadDMs: "",          // can't reconstruct
-    smsInbound: "",         // SMS log could be read, but skip for now
-    smsOutbound: "",
+    smsInbound: smsInbound,
+    smsOutbound: smsOutbound,
   });
 
   advanceBackfillDate(props, nextDate);
-  Logger.log("Backfill complete for " + nextDate);
+  existingDates.add(nextDate); // Mark as done so we don't re-process within this run
+  daysProcessed++;
+  Logger.log("Backfill complete for " + nextDate + " (" + daysProcessed + " days this run, " + Math.round((new Date() - runStart) / 1000) + "s elapsed)");
+
+  } // end while loop
 }
 
 function advanceBackfillDate(props, currentDate) {
@@ -8823,9 +9234,9 @@ function setupBackfillTrigger() {
   cleanupBackfillTrigger();
   ScriptApp.newTrigger("backfillOneDay")
     .timeBased()
-    .everyMinutes(10)
+    .everyMinutes(1)
     .create();
-  Logger.log("Backfill trigger created — runs every 10 minutes. Set BACKFILL_START_DATE to begin.");
+  Logger.log("Backfill trigger created — runs every 1 minute. Set BACKFILL_START_DATE to begin.");
 }
 
 function cleanupBackfillTrigger() {
@@ -8932,7 +9343,7 @@ function sendNonWorkingDaySnapshot(zendesk, meta, now, dateStr, tz, recipients) 
 
   html += `
       <div style="text-align:center;padding:16px 0 8px;font-size:11px;color:#999;">
-        CS Visibility · AI Recap v2.5.4 · Non-Working Day · ${dateStr}
+        CS Visibility · AI Recap v2.5.64 · Non-Working Day · ${dateStr}
       </div>
     </div>
   </div>`;
@@ -8945,6 +9356,79 @@ function sendNonWorkingDaySnapshot(zendesk, meta, now, dateStr, tz, recipients) 
   });
 
   Logger.log("Non-working day snapshot sent to: " + recipients);
+
+  // ── Log metrics for non-working days too (tickets still get created on weekends/holidays) ──
+  try {
+    const todayStr = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+    const dayOfWeek = Utilities.formatDate(now, tz, "EEEE");
+
+    // Count tickets created today via Zendesk search
+    const zdProps = PropertiesService.getScriptProperties();
+    const zdToken = zdProps.getProperty("ZENDESK_TOKEN");
+    const subdomain = CONFIG.zendesk.subdomain;
+    const zdAuth = "Basic " + Utilities.base64Encode(zdToken);
+    const zdOpts = { method: "get", headers: { "Authorization": zdAuth, "Content-Type": "application/json" }, muteHttpExceptions: true };
+    const solvedFilter = `-tags:aircall -tags:internal__testing -tags:auto_close -assignee:"AI Agent"`;
+
+    let ticketsCreated = 0;
+    let solvedTotal = 0;
+    try {
+      const createdUrl = `https://${subdomain}.zendesk.com/api/v2/search/count.json?query=${encodeURIComponent("type:ticket created>=" + todayStr + " " + solvedFilter)}`;
+      const createdResp = UrlFetchApp.fetch(createdUrl, zdOpts);
+      if (createdResp.getResponseCode() === 200) ticketsCreated = JSON.parse(createdResp.getContentText()).count || 0;
+
+      const solvedUrl = `https://${subdomain}.zendesk.com/api/v2/search/count.json?query=${encodeURIComponent("type:ticket solved>=" + todayStr + " " + solvedFilter)}`;
+      const solvedResp = UrlFetchApp.fetch(solvedUrl, zdOpts);
+      if (solvedResp.getResponseCode() === 200) solvedTotal = JSON.parse(solvedResp.getContentText()).count || 0;
+    } catch (e) { Logger.log("Non-working day ZD count error: " + e); }
+
+    logDailyMetrics({
+      date: todayStr,
+      dayOfWeek: dayOfWeek,
+      openTickets: zendesk.totalOpen || "",
+      unassigned: zendesk.unassigned || "",
+      onHold: zendesk.onHoldQueueCount || "",
+      pastSla: zendesk.totalBreached || "",
+      sasTickets: sasCount,
+      openVoicemails: vmCount,
+      aiAgentTickets: zendesk.aiAgentCount || "",
+      ticketsCreated: ticketsCreated,
+      solvedTotal: solvedTotal,
+      agentSolved: CONFIG.agents.map(() => 0),
+      answerRate: "",
+      inboundCalls: 0,
+      forwardedToSAS: 0,
+      outboundCalls: 0,
+      avgWaitTime: 0,
+      avgCallDuration: 0,
+      agentInbound: CONFIG.agents.map(() => 0),
+      agentOutbound: CONFIG.agents.map(() => 0),
+      agentInTalk: CONFIG.agents.map(() => 0),
+      agentOutTalk: CONFIG.agents.map(() => 0),
+      csatPct: "",
+      csatResponses: 0,
+      csatSatisfied: 0,
+      phoneCsatPct: "",
+      phoneCsatResponses: 0,
+      agentEmailCsatSat: CONFIG.agents.map(() => 0),
+      agentEmailCsatTot: CONFIG.agents.map(() => 0),
+      agentPhoneCsatSat: CONFIG.agents.map(() => 0),
+      agentPhoneCsatTot: CONFIG.agents.map(() => 0),
+      medianFrt: "",
+      avgFrt: "",
+      medianResolution: "",
+      avgResolution: "",
+      emailNps: "",
+      phoneNps: "",
+      ces: "",
+      unreadDMs: metaUnread,
+      smsInbound: 0,
+      smsOutbound: 0,
+    });
+    Logger.log("Non-working day metrics logged for " + todayStr + " (tickets created: " + ticketsCreated + ")");
+  } catch (e) {
+    Logger.log("Non-working day metrics logging failed (non-fatal): " + e);
+  }
 }
 
 // ─── CLEANUP & PATCH DAILY METRICS LOG ───
@@ -9087,6 +9571,797 @@ function cleanupDailyMetricsLog() {
   Logger.log("Daily Metrics Log cleaned: " + data.length + " rows sorted by date, phone CSAT patched");
 }
 
+// ─── PATCH MISSING METRICS (SMS, Phone CSAT/NPS, Email NPS/CES, FRT/Resolution) ───
+// Runs as a triggered function. Each invocation patches a batch of rows.
+// Uses CSV data from project folder + Aircall API for SMS.
+// Set PATCH_METRICS_START property to begin (or it patches all rows).
+function patchMissingMetrics() {
+  loadThresholds();
+  const runStart = new Date();
+  const MAX_RUN_MS = 4.5 * 60 * 1000;
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Daily Metrics Log");
+  if (!sheet || sheet.getLastRow() <= 1) { Logger.log("No data to patch"); return; }
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const lastRow = sheet.getLastRow();
+  const data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+
+  // Column indices
+  const col = (name) => headers.indexOf(name);
+  const dateCol = col("Date");
+  const smsInCol = col("SMS Inbound");
+  const smsOutCol = col("SMS Outbound");
+  const phoneCsatCol = col("Phone CSAT %");
+  const phoneCsatRespCol = col("Phone CSAT Responses");
+  const emailNpsCol = col("Email NPS");
+  const phoneNpsCol = col("Phone NPS");
+  const cesCol = col("CES");
+  const medFrtCol = col("Median FRT (biz hrs)");
+  const avgFrtCol = col("Avg FRT (biz hrs)");
+  const medResCol = col("Median Resolution (biz hrs)");
+  const avgResCol = col("Avg Resolution (biz hrs)");
+
+  // ── Load PostCall CSV data (phone CSAT + NPS by date) ──
+  const pcByDate = {};
+  try {
+    const pcSheet = ss.getSheetByName("PostCall Log");
+    if (pcSheet && pcSheet.getLastRow() > 1) {
+      const pcData = pcSheet.getRange(2, 1, pcSheet.getLastRow() - 1, 12).getValues();
+      pcData.forEach(row => {
+        const ts = new Date(row[0]);
+        if (isNaN(ts)) return;
+        const dateStr = Utilities.formatDate(ts, tz, "yyyy-MM-dd");
+        if (String(row[1] || "") !== "survey-completed") return;
+        const agentName = String(row[4] || "");
+        const excluded = CONFIG.excludePostCallAgents.some(ex => agentName.toLowerCase().includes(ex.toLowerCase()));
+        if (excluded) return;
+        const csatScore = Number(row[2]) || 0;
+        if (!csatScore) return;
+        if (!pcByDate[dateStr]) pcByDate[dateStr] = { satisfied: 0, total: 0, npsScores: [] };
+        pcByDate[dateStr].total++;
+        if (csatScore >= 4) pcByDate[dateStr].satisfied++;
+        const nps = Number(row[3]);
+        if (!isNaN(nps) && nps >= 0) pcByDate[dateStr].npsScores.push(nps);
+      });
+    }
+  } catch (e) { Logger.log("PostCall load error: " + e); }
+
+  // ── Load Nicereply CSV data (email NPS + CES by date) ──
+  // This reads from the Nicereply API (already fetched during backfill for CSAT)
+  // For NPS/CES we need the CSV since the API call only gets the primary CSAT score
+  // The CSV should be imported into a "Nicereply Import" sheet
+  const nrByDate = {};
+  try {
+    const nrSheet = ss.getSheetByName("Nicereply Import");
+    if (nrSheet && nrSheet.getLastRow() > 1) {
+      const nrHeaders = nrSheet.getRange(1, 1, 1, nrSheet.getLastColumn()).getValues()[0];
+      const nrData = nrSheet.getRange(2, 1, nrSheet.getLastRow() - 1, nrHeaders.length).getValues();
+      const nrCreatedCol = nrHeaders.findIndex(h => String(h).toLowerCase() === "created");
+      const nrNpsCol = nrHeaders.findIndex(h => String(h).toLowerCase().includes("recommend"));
+      const nrCesCol = nrHeaders.findIndex(h => String(h).toLowerCase().includes("easy"));
+
+      if (nrCreatedCol >= 0) {
+        nrData.forEach(row => {
+          const created = String(row[nrCreatedCol] || "");
+          const dateStr = created.substring(0, 10);
+          if (!dateStr || dateStr.length < 10) return;
+          if (!nrByDate[dateStr]) nrByDate[dateStr] = { npsScores: [], cesScores: [] };
+          if (nrNpsCol >= 0) {
+            const nps = Number(row[nrNpsCol]);
+            if (!isNaN(nps) && nps >= 0) nrByDate[dateStr].npsScores.push(nps);
+          }
+          if (nrCesCol >= 0) {
+            const ces = Number(row[nrCesCol]);
+            if (!isNaN(ces) && ces > 0) nrByDate[dateStr].cesScores.push(ces);
+          }
+        });
+      }
+    }
+  } catch (e) { Logger.log("Nicereply import load error: " + e); }
+
+  // ── Aircall SMS + Zendesk FRT setup ──
+  const apiId = props.getProperty("AIRCALL_API_ID");
+  const apiToken = props.getProperty("AIRCALL_API_TOKEN");
+  const acAuth = (apiId && apiToken) ? "Basic " + Utilities.base64Encode(apiId + ":" + apiToken) : null;
+  const baseUrl = CONFIG.aircall.baseUrl;
+
+  const zdToken = props.getProperty("ZENDESK_TOKEN");
+  const subdomain = CONFIG.zendesk.subdomain;
+  const zdAuth = zdToken ? "Basic " + Utilities.base64Encode(zdToken) : null;
+  const zdOpts = zdAuth ? { method: "get", headers: { "Authorization": zdAuth, "Content-Type": "application/json" }, muteHttpExceptions: true } : null;
+
+  // Pre-fetch Aircall number IDs for SMS (reused across all rows)
+  let acNumberIds = [];
+  if (acAuth) {
+    try {
+      const resp = UrlFetchApp.fetch(`${baseUrl}/numbers?per_page=50`, { method: "get", headers: { "Authorization": acAuth }, muteHttpExceptions: true });
+      if (resp.getResponseCode() === 200) {
+        acNumberIds = (JSON.parse(resp.getContentText()).numbers || []).map(n => n.id);
+      }
+    } catch (e) { Logger.log("Aircall numbers fetch error: " + e); }
+  }
+
+  const excludeLines = CONFIG.excludeSMSLines || [];
+  const solvedFilter = `-tags:aircall -tags:internal__testing -tags:auto_close -assignee:"AI Agent"`;
+
+  // Track which row to start from (for resume across trigger runs)
+  const startIdx = Number(props.getProperty("PATCH_METRICS_IDX") || "0");
+  let patched = 0;
+  let rowsChecked = 0;
+
+  for (let i = startIdx; i < data.length; i++) {
+    if (new Date() - runStart > MAX_RUN_MS) {
+      props.setProperty("PATCH_METRICS_IDX", String(i));
+      Logger.log("Patch time limit after " + patched + " patches (" + rowsChecked + " rows checked). Will resume at row " + (i + 2));
+      return;
+    }
+
+    const row = data[i];
+    const rawDate = row[dateCol];
+    if (!rawDate) continue;
+    const dateStr = rawDate instanceof Date
+      ? Utilities.formatDate(rawDate, tz, "yyyy-MM-dd")
+      : String(rawDate).substring(0, 10);
+    rowsChecked++;
+    let dirty = false;
+    const sheetRow = i + 2; // 1-indexed + header
+
+    // ── Patch SMS (if blank) ──
+    if (smsInCol >= 0 && smsOutCol >= 0 && (row[smsInCol] === "" || row[smsInCol] === null || row[smsInCol] === undefined) && acAuth && acNumberIds.length > 0) {
+      let smsIn = 0, smsOut = 0;
+      try {
+        const dayStart = new Date(dateStr + "T00:00:00");
+        const dayEnd = new Date(dateStr + "T23:59:59");
+        const fromTs = Math.floor(dayStart.getTime() / 1000) + 7 * 3600;
+        const toTs = Math.floor(dayEnd.getTime() / 1000) + 7 * 3600;
+
+        acNumberIds.forEach(numId => {
+          try {
+            let page = 1;
+            let more = true;
+            while (more && page <= 5) {
+              const url = `${baseUrl}/numbers/${numId}/messages?from=${fromTs}&to=${toTs}&per_page=50&page=${page}&order=desc`;
+              const resp = UrlFetchApp.fetch(url, { method: "get", headers: { "Authorization": acAuth }, muteHttpExceptions: true });
+              if (resp.getResponseCode() !== 200) break;
+              const msgs = JSON.parse(resp.getContentText()).messages || [];
+              if (msgs.length === 0) break;
+              msgs.forEach(m => {
+                const lineName = (m.number && m.number.name) || "";
+                if (excludeLines.some(ex => lineName.toLowerCase() === ex.toLowerCase())) return;
+                if (m.direction === "inbound") smsIn++;
+                else if (m.direction === "outbound") smsOut++;
+              });
+              more = msgs.length === 50;
+              page++;
+            }
+          } catch (e) { /* skip number */ }
+        });
+      } catch (e) { Logger.log("SMS patch error for " + dateStr + ": " + e); }
+      sheet.getRange(sheetRow, smsInCol + 1).setValue(smsIn);
+      sheet.getRange(sheetRow, smsOutCol + 1).setValue(smsOut);
+      dirty = true;
+    }
+
+    // ── Patch Phone CSAT + Phone NPS (from PostCall Log) ──
+    if (phoneCsatCol >= 0 && (row[phoneCsatCol] === "" || row[phoneCsatCol] === null || row[phoneCsatCol] === undefined)) {
+      const pc = pcByDate[dateStr];
+      if (pc && pc.total > 0) {
+        const pct = Math.round((pc.satisfied / pc.total) * 100);
+        sheet.getRange(sheetRow, phoneCsatCol + 1).setValue(pct);
+        if (phoneCsatRespCol >= 0) sheet.getRange(sheetRow, phoneCsatRespCol + 1).setValue(pc.total);
+        dirty = true;
+      }
+    }
+    if (phoneNpsCol >= 0 && (row[phoneNpsCol] === "" || row[phoneNpsCol] === null || row[phoneNpsCol] === undefined)) {
+      const pc = pcByDate[dateStr];
+      if (pc && pc.npsScores.length > 0) {
+        const promoters = pc.npsScores.filter(s => s >= 9).length;
+        const detractors = pc.npsScores.filter(s => s <= 6).length;
+        const nps = Math.round((promoters - detractors) / pc.npsScores.length * 100);
+        sheet.getRange(sheetRow, phoneNpsCol + 1).setValue(nps);
+        dirty = true;
+      }
+    }
+
+    // ── Patch Email NPS + CES (from Nicereply Import sheet) ──
+    if (emailNpsCol >= 0 && (row[emailNpsCol] === "" || row[emailNpsCol] === null || row[emailNpsCol] === undefined)) {
+      const nr = nrByDate[dateStr];
+      if (nr && nr.npsScores.length > 0) {
+        const promoters = nr.npsScores.filter(s => s >= 9).length;
+        const detractors = nr.npsScores.filter(s => s <= 6).length;
+        const nps = Math.round((promoters - detractors) / nr.npsScores.length * 100);
+        sheet.getRange(sheetRow, emailNpsCol + 1).setValue(nps);
+        dirty = true;
+      }
+    }
+    if (cesCol >= 0 && (row[cesCol] === "" || row[cesCol] === null || row[cesCol] === undefined)) {
+      const nr = nrByDate[dateStr];
+      if (nr && nr.cesScores.length > 0) {
+        const avgCes = Math.round(nr.cesScores.reduce((a, b) => a + b, 0) / nr.cesScores.length * 10) / 10;
+        sheet.getRange(sheetRow, cesCol + 1).setValue(avgCes);
+        dirty = true;
+      }
+    }
+
+    // ── Patch FRT/Resolution (if blank, from Zendesk ticket metrics) ──
+    if (medFrtCol >= 0 && (row[medFrtCol] === "" || row[medFrtCol] === null || row[medFrtCol] === undefined) && zdOpts) {
+      try {
+        const nextDatePlusOne = Utilities.formatDate(new Date(new Date(dateStr + "T12:00:00").getTime() + 86400000), tz, "yyyy-MM-dd");
+        // Fetch ticket IDs
+        let ticketIds = [];
+        let page = 1;
+        while (page <= 3) {
+          const url = `https://${subdomain}.zendesk.com/api/v2/search.json?query=${encodeURIComponent("type:ticket solved>=" + dateStr + " solved<" + nextDatePlusOne + " " + solvedFilter)}&per_page=100&page=${page}`;
+          const resp = UrlFetchApp.fetch(url, zdOpts);
+          if (resp.getResponseCode() === 200) {
+            const results = JSON.parse(resp.getContentText()).results || [];
+            ticketIds = ticketIds.concat(results.map(t => t.id));
+            if (results.length < 100) break;
+            page++;
+          } else break;
+        }
+        if (ticketIds.length > 0) {
+          const metrics = fetchTicketResponseMetrics(ticketIds, zdOpts, subdomain);
+          if (metrics.medianFrt !== "") sheet.getRange(sheetRow, medFrtCol + 1).setValue(metrics.medianFrt);
+          if (metrics.avgFrt !== "") sheet.getRange(sheetRow, avgFrtCol + 1).setValue(metrics.avgFrt);
+          if (metrics.medianResolution !== "") sheet.getRange(sheetRow, medResCol + 1).setValue(metrics.medianResolution);
+          if (metrics.avgResolution !== "") sheet.getRange(sheetRow, avgResCol + 1).setValue(metrics.avgResolution);
+          dirty = true;
+        }
+      } catch (e) { Logger.log("FRT patch error for " + dateStr + ": " + e); }
+    }
+
+    if (dirty) patched++;
+  }
+
+  // Done — clean up
+  props.deleteProperty("PATCH_METRICS_IDX");
+  Logger.log("Patch complete: " + patched + " rows patched, " + rowsChecked + " rows checked");
+}
+
+function setupPatchTrigger() {
+  // Clean up existing
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "patchMissingMetrics") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("patchMissingMetrics")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+  Logger.log("Patch trigger created - runs every 1 minute");
+}
+
+function cleanupPatchTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "patchMissingMetrics") {
+      ScriptApp.deleteTrigger(t);
+      Logger.log("Removed patch trigger");
+    }
+  });
+}
+
+// ─── PATCH PHONE CSAT FROM CSV (PostCall Import sheet) ───
+// One-time function. Import PostCall CSV into a sheet named "PostCall Import",
+// then run this to aggregate Phone CSAT % and Phone NPS by date into the Daily Metrics Log.
+// PostCall survey timestamps (sent_at) come from the export in UTC. Convert to the Pacific
+// calendar day so surveys bucket on the same business day as calls (which are Pacific).
+// Handles both raw strings ("YYYY-MM-DD HH:MM:SS") and Date cells from the imported sheet.
+function postCallPacificDate(rawTs) {
+  if (rawTs === "" || rawTs === null || rawTs === undefined) return null;
+  let wall;
+  if (rawTs instanceof Date) {
+    // Sheets stored the UTC wall-clock as a date in the script tz; recover that wall-clock string
+    wall = Utilities.formatDate(rawTs, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
+  } else {
+    wall = String(rawTs).trim().replace(" ", "T");
+    if (wall.length === 10) wall += "T00:00:00";
+  }
+  const utc = new Date(wall + "Z");   // interpret the wall-clock as UTC
+  if (isNaN(utc.getTime())) return null;
+  return Utilities.formatDate(utc, CONFIG.businessHours.timezone, "yyyy-MM-dd");
+}
+
+// Match a PostCall agent_name (full name) to a core agent's first name, or null. Used to
+// attribute per-agent phone CSAT during the CSV backfill.
+function phoneCsatMatchAgent_(agentName) {
+  const n = String(agentName || "").trim().toLowerCase();
+  if (!n) return null;
+  for (let i = 0; i < CONFIG.agents.length; i++) {
+    const full = CONFIG.agents[i].toLowerCase();
+    const first = CONFIG.agents[i].split(" ")[0].toLowerCase();
+    if (n === full || n === first || n.indexOf(first + " ") === 0) return CONFIG.agents[i].split(" ")[0];
+  }
+  return null;
+}
+
+function patchPhoneCsatFromCSV() {
+  const tz = CONFIG.businessHours.timezone;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ── Read PostCall Import sheet ──
+  const importSheet = ss.getSheetByName("PostCall Import");
+  if (!importSheet || importSheet.getLastRow() <= 1) {
+    Logger.log("No data in PostCall Import sheet"); return;
+  }
+  const importHeaders = importSheet.getRange(1, 1, 1, importSheet.getLastColumn()).getValues()[0].map(h => String(h).trim().toLowerCase());
+  const importData = importSheet.getRange(2, 1, importSheet.getLastRow() - 1, importHeaders.length).getValues();
+
+  // Find column indices by header name
+  const sentAtIdx = importHeaders.indexOf("sent_at");
+  const csatIdx = importHeaders.indexOf("how_did_we_do_today");
+  const agentIdx = importHeaders.indexOf("agent_name");
+
+  // Find the NPS column(s) — there may be two with the same long name; pick whichever has data
+  const npsIndices = [];
+  importHeaders.forEach((h, i) => {
+    if (h.startsWith("how_likely_is_it_that_you_would_recommend")) npsIndices.push(i);
+  });
+
+  if (sentAtIdx < 0 || csatIdx < 0) {
+    Logger.log("PostCall Import: could not find required columns (sent_at=" + sentAtIdx + ", how_did_we_do_today=" + csatIdx + ")");
+    return;
+  }
+
+  // ── Aggregate by date ──
+  const byDate = {}; // { "yyyy-MM-dd": { satisfied, total, npsScores[] } }
+
+  importData.forEach(row => {
+    // Parse sent_at (UTC) and bucket on the Pacific calendar day to match call data
+    const rawTs = row[sentAtIdx];
+    if (!rawTs) return;
+    const dateStr = postCallPacificDate(rawTs);
+    if (!dateStr) return;
+
+    // Filter excluded agents
+    const agentName = agentIdx >= 0 ? String(row[agentIdx] || "") : "";
+    const excluded = CONFIG.excludePostCallAgents.some(ex => agentName.toLowerCase().includes(ex.toLowerCase()));
+    if (excluded) return;
+
+    // Parse CSAT
+    const rawCsat = String(row[csatIdx] || "").trim().toLowerCase();
+    if (!rawCsat) return;
+
+    if (!byDate[dateStr]) byDate[dateStr] = { satisfied: 0, total: 0, npsScores: [], agents: {} };
+    byDate[dateStr].total++;
+
+    // CSAT mapping (satisfied = 4+ out of 5): text "great" (5) and "good" (4) are both
+    // satisfied; "ok"/"okay" (3), "bad" (2), "terrible" (1) are not. Numeric ratings use >= 4.
+    const numCsat = Number(rawCsat);
+    const isSat = !isNaN(numCsat) ? (numCsat >= 4) : (rawCsat === "great" || rawCsat === "good");
+    if (isSat) byDate[dateStr].satisfied++;
+
+    // Per-agent attribution: match agent_name to a core agent so the per-agent phone CSAT columns
+    // get backfilled too (the original patch only aggregated by date, leaving them empty).
+    const pcaFirst = phoneCsatMatchAgent_(agentName);
+    if (pcaFirst) {
+      const ag = byDate[dateStr].agents[pcaFirst] || (byDate[dateStr].agents[pcaFirst] = { sat: 0, tot: 0 });
+      ag.tot++; if (isSat) ag.sat++;
+    }
+
+    // Parse NPS from whichever column has data (skip empty cells - Number("") = 0 which is a false positive)
+    for (let ni = 0; ni < npsIndices.length; ni++) {
+      const rawNps = row[npsIndices[ni]];
+      if (rawNps === "" || rawNps === null || rawNps === undefined) continue;
+      const npsVal = Number(rawNps);
+      if (!isNaN(npsVal) && npsVal >= 0 && npsVal <= 10) {
+        byDate[dateStr].npsScores.push(npsVal);
+        break; // only count once per row
+      }
+    }
+  });
+
+  // ── Read Daily Metrics Log ──
+  const logSheet = ss.getSheetByName("Daily Metrics Log");
+  if (!logSheet || logSheet.getLastRow() <= 1) { Logger.log("No Daily Metrics Log data"); return; }
+
+  const logHeaders = logSheet.getRange(1, 1, 1, logSheet.getLastColumn()).getValues()[0];
+  const lastRow = logSheet.getLastRow();
+  const logData = logSheet.getRange(2, 1, lastRow - 1, logHeaders.length).getValues();
+
+  const dateCol = logHeaders.indexOf("Date");
+  const phoneCsatCol = logHeaders.indexOf("Phone CSAT %");
+  const phoneCsatRespCol = logHeaders.indexOf("Phone CSAT Responses");
+  const phoneNpsCol = logHeaders.indexOf("Phone NPS");
+  const phoneSatCol = {}, phoneTotCol = {};
+  CONFIG.agents.forEach(a => {
+    const f = a.split(" ")[0];
+    phoneSatCol[f] = logHeaders.indexOf("Phone CSAT Sat: " + f);
+    phoneTotCol[f] = logHeaders.indexOf("Phone CSAT Tot: " + f);
+  });
+
+  if (dateCol < 0 || phoneCsatCol < 0) {
+    Logger.log("Daily Metrics Log missing required columns"); return;
+  }
+
+  let patchedCsat = 0, patchedNps = 0;
+
+  for (let i = 0; i < logData.length; i++) {
+    const rawDate = logData[i][dateCol];
+    if (!rawDate) continue;
+    const dateStr = rawDate instanceof Date
+      ? Utilities.formatDate(rawDate, tz, "yyyy-MM-dd")
+      : String(rawDate).substring(0, 10);
+    const sheetRow = i + 2;
+    const agg = byDate[dateStr];
+    if (!agg || agg.total === 0) continue;
+
+    // Write Phone CSAT % from the CSV. Overwrites existing values so the older great-only
+    // numbers get corrected to the 4+ (great + good) standard. Idempotent on re-run.
+    const pct = Math.round((agg.satisfied / agg.total) * 100);
+    logSheet.getRange(sheetRow, phoneCsatCol + 1).setValue(pct);
+    if (phoneCsatRespCol >= 0) logSheet.getRange(sheetRow, phoneCsatRespCol + 1).setValue(agg.total);
+    patchedCsat++;
+
+    // Backfill per-agent phone CSAT (CSV is authoritative; overwrites idempotently). Days with no
+    // surveys for an agent get 0, which is correct.
+    CONFIG.agents.forEach(a => {
+      const f = a.split(" ")[0];
+      const ad = (agg.agents && agg.agents[f]) || { sat: 0, tot: 0 };
+      if (phoneSatCol[f] >= 0) logSheet.getRange(sheetRow, phoneSatCol[f] + 1).setValue(ad.sat);
+      if (phoneTotCol[f] >= 0) logSheet.getRange(sheetRow, phoneTotCol[f] + 1).setValue(ad.tot);
+    });
+
+    // Patch Phone NPS if blank
+    if (phoneNpsCol >= 0) {
+      const currentNps = logData[i][phoneNpsCol];
+      if ((currentNps === "" || currentNps === null || currentNps === undefined) && agg.npsScores.length > 0) {
+        const promoters = agg.npsScores.filter(s => s >= 9).length;
+        const detractors = agg.npsScores.filter(s => s <= 6).length;
+        const nps = Math.round((promoters - detractors) / agg.npsScores.length * 100);
+        logSheet.getRange(sheetRow, phoneNpsCol + 1).setValue(nps);
+        patchedNps++;
+      }
+    }
+  }
+
+  Logger.log("patchPhoneCsatFromCSV complete: " + Object.keys(byDate).length + " dates in CSV, "
+    + patchedCsat + " CSAT rows patched, " + patchedNps + " NPS rows patched");
+}
+
+// ─── FIX: Rerun Phone NPS patch (overwrites existing bad -100 values) ───
+function repatchPhoneNps() {
+  const tz = CONFIG.businessHours.timezone;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const importSheet = ss.getSheetByName("PostCall Import");
+  if (!importSheet || importSheet.getLastRow() <= 1) { Logger.log("No PostCall Import"); return; }
+  const importHeaders = importSheet.getRange(1, 1, 1, importSheet.getLastColumn()).getValues()[0].map(h => String(h).trim().toLowerCase());
+  const importData = importSheet.getRange(2, 1, importSheet.getLastRow() - 1, importHeaders.length).getValues();
+
+  const sentAtIdx = importHeaders.indexOf("sent_at");
+  const agentIdx = importHeaders.indexOf("agent_name");
+  const npsIndices = [];
+  importHeaders.forEach((h, i) => {
+    if (h.startsWith("how_likely_is_it_that_you_would_recommend")) npsIndices.push(i);
+  });
+
+  // Aggregate NPS by date (fixed: skip empty cells)
+  const byDate = {};
+  importData.forEach(row => {
+    const rawTs = row[sentAtIdx];
+    if (!rawTs) return;
+    const dateStr = postCallPacificDate(rawTs);
+    if (!dateStr) return;
+    const agentName = agentIdx >= 0 ? String(row[agentIdx] || "") : "";
+    if (CONFIG.excludePostCallAgents.some(ex => agentName.toLowerCase().includes(ex.toLowerCase()))) return;
+
+    for (let ni = 0; ni < npsIndices.length; ni++) {
+      const rawNps = row[npsIndices[ni]];
+      if (rawNps === "" || rawNps === null || rawNps === undefined) continue;
+      const npsVal = Number(rawNps);
+      if (!isNaN(npsVal) && npsVal >= 0 && npsVal <= 10) {
+        if (!byDate[dateStr]) byDate[dateStr] = [];
+        byDate[dateStr].push(npsVal);
+        break;
+      }
+    }
+  });
+
+  // Overwrite Phone NPS in metrics log
+  const logSheet = ss.getSheetByName("Daily Metrics Log");
+  if (!logSheet || logSheet.getLastRow() <= 1) return;
+  const logHeaders = logSheet.getRange(1, 1, 1, logSheet.getLastColumn()).getValues()[0];
+  const logData = logSheet.getRange(2, 1, logSheet.getLastRow() - 1, logHeaders.length).getValues();
+  const dateCol = logHeaders.indexOf("Date");
+  const phoneNpsCol = logHeaders.indexOf("Phone NPS");
+  if (phoneNpsCol < 0) { Logger.log("No Phone NPS column"); return; }
+
+  let patched = 0;
+  for (let i = 0; i < logData.length; i++) {
+    const rawDate = logData[i][dateCol];
+    if (!rawDate) continue;
+    const dateStr = rawDate instanceof Date ? Utilities.formatDate(rawDate, tz, "yyyy-MM-dd") : String(rawDate).substring(0, 10);
+    const scores = byDate[dateStr];
+    if (!scores || scores.length === 0) {
+      // No NPS data for this date - clear any bad value
+      if (logData[i][phoneNpsCol] !== "" && logData[i][phoneNpsCol] !== null && logData[i][phoneNpsCol] !== undefined) {
+        logSheet.getRange(i + 2, phoneNpsCol + 1).setValue("");
+        patched++;
+      }
+      continue;
+    }
+    const promoters = scores.filter(s => s >= 9).length;
+    const detractors = scores.filter(s => s <= 6).length;
+    const nps = Math.round((promoters - detractors) / scores.length * 100);
+    logSheet.getRange(i + 2, phoneNpsCol + 1).setValue(nps);
+    patched++;
+  }
+  Logger.log("repatchPhoneNps complete: " + patched + " rows updated, " + Object.keys(byDate).length + " dates with NPS data");
+}
+
+// SAS Flex "Call Report" exports stamp "Date Time" in UTC. Convert to the Pacific calendar
+// day. Handles raw strings ("M/D/YYYY h:mm:ss AM/PM") and Date cells from the imported sheet.
+function sasPacificDate(raw) {
+  if (raw === "" || raw === null || raw === undefined) return null;
+  let utcMs;
+  if (raw instanceof Date) {
+    const wall = Utilities.formatDate(raw, Session.getScriptTimeZone(), "yyyy-MM-dd'T'HH:mm:ss");
+    const d = new Date(wall + "Z");
+    if (isNaN(d.getTime())) return null;
+    utcMs = d.getTime();
+  } else {
+    const m = String(raw).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})\s*([AP]M)/i);
+    if (!m) return null;
+    let H = Number(m[4]); const pm = /pm/i.test(m[7]);
+    if (pm && H < 12) H += 12;
+    if (!pm && H === 12) H = 0;
+    utcMs = Date.UTC(Number(m[3]), Number(m[1]) - 1, Number(m[2]), H, Number(m[5]), Number(m[6]));
+  }
+  return Utilities.formatDate(new Date(utcMs), CONFIG.businessHours.timezone, "yyyy-MM-dd");
+}
+
+// ─── SAS FLEX: backfill ALL-call volume into the Daily Metrics Log ───
+// Paste the SAS "Call Report" exports (all months) into a sheet named "SAS Import" with the
+// export header row on top. This counts EVERY SAS call per Pacific day, overwrites the
+// "Forwarded to SAS" column with the true SAS volume (replacing the Aircall proxy), and
+// recomputes "Answer Rate %" on working days only (blank on weekends/holidays).
+function patchSasVolumeFromImport() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = CONFIG.businessHours.timezone;
+
+  const imp = ss.getSheetByName("SAS Import");
+  if (!imp || imp.getLastRow() <= 1) { Logger.log("No data in 'SAS Import' sheet"); return; }
+  const ih = imp.getRange(1, 1, 1, imp.getLastColumn()).getValues()[0].map(h => String(h).trim().toLowerCase());
+  const dtIdx = ih.indexOf("date time");
+  if (dtIdx < 0) { Logger.log("SAS Import: 'Date Time' column not found"); return; }
+  const impData = imp.getRange(2, 1, imp.getLastRow() - 1, ih.length).getValues();
+
+  // Count ALL SAS calls per Pacific day
+  const byDate = {};
+  impData.forEach(row => {
+    const d = sasPacificDate(row[dtIdx]);
+    if (!d) return;
+    byDate[d] = (byDate[d] || 0) + 1;
+  });
+  const dates = Object.keys(byDate).sort();
+  if (dates.length === 0) { Logger.log("SAS Import: no parseable dates"); return; }
+  const minD = dates[0], maxD = dates[dates.length - 1];
+
+  const log = ss.getSheetByName("Daily Metrics Log");
+  if (!log || log.getLastRow() <= 1) { Logger.log("No Daily Metrics Log"); return; }
+  const lh = log.getRange(1, 1, 1, log.getLastColumn()).getValues()[0];
+  const dateCol = lh.indexOf("Date");
+  const fwdCol = lh.indexOf("Forwarded to SAS");
+  const rateCol = lh.indexOf("Answer Rate %");
+  const inbCol = lh.indexOf("Inbound Calls");
+  if (dateCol < 0 || fwdCol < 0) { Logger.log("Log missing Date/Forwarded columns"); return; }
+  const logData = log.getRange(2, 1, log.getLastRow() - 1, lh.length).getValues();
+  const holidays = getDeakoHolidays();
+
+  let updated = 0;
+  for (let i = 0; i < logData.length; i++) {
+    const rawDate = logData[i][dateCol];
+    if (!rawDate) continue;
+    const dateStr = rawDate instanceof Date ? Utilities.formatDate(rawDate, tz, "yyyy-MM-dd") : String(rawDate).substring(0, 10);
+    if (dateStr < minD || dateStr > maxD) continue;   // only within the SAS-covered range
+    const fwd = byDate[dateStr] || 0;                  // zero-fill days with no SAS calls
+    const sheetRow = i + 2;
+    log.getRange(sheetRow, fwdCol + 1).setValue(fwd);
+    if (rateCol >= 0) {
+      const dt = new Date(dateStr + "T12:00:00");
+      if (isNonWorkingDay(dt, holidays)) {
+        log.getRange(sheetRow, rateCol + 1).setValue("");          // answer rate: working days only
+      } else if (inbCol >= 0) {
+        const inb = Number(logData[i][inbCol]) || 0;
+        log.getRange(sheetRow, rateCol + 1).setValue((inb + fwd) > 0 ? Math.round(inb / (inb + fwd) * 100) : 100);
+      }
+    }
+    updated++;
+  }
+  Logger.log("patchSasVolumeFromImport: " + updated + " log rows updated from " + impData.length + " SAS calls (" + minD + " to " + maxD + ").");
+}
+
+// ─── FIX: Clear answer rate on weekends/holidays ───
+function clearWeekendAnswerRates() {
+  loadThresholds();
+  const tz = CONFIG.businessHours.timezone;
+  const holidays = getDeakoHolidays();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Daily Metrics Log");
+  if (!sheet || sheet.getLastRow() <= 1) return;
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues();
+  const dateCol = headers.indexOf("Date");
+  const ansRateCol = headers.indexOf("Answer Rate %");
+  if (dateCol < 0 || ansRateCol < 0) return;
+
+  let cleared = 0;
+  for (let i = 0; i < data.length; i++) {
+    const rawDate = data[i][dateCol];
+    if (!rawDate) continue;
+    const dateStr = rawDate instanceof Date ? Utilities.formatDate(rawDate, tz, "yyyy-MM-dd") : String(rawDate).substring(0, 10);
+    const dt = new Date(dateStr + "T12:00:00");
+    if (isNonWorkingDay(dt, holidays)) {
+      const current = data[i][ansRateCol];
+      if (current !== "" && current !== null && current !== undefined) {
+        sheet.getRange(i + 2, ansRateCol + 1).setValue("");
+        cleared++;
+      }
+    }
+  }
+  Logger.log("clearWeekendAnswerRates: cleared " + cleared + " non-working day answer rates");
+}
+
+// ─── PATCH SMS FROM CSV (SMS Import sheet) ───
+// One-time function. Import Aircall SMS CSV into a sheet named "SMS Import",
+// then run this to aggregate inbound/outbound SMS counts by date into the Daily Metrics Log.
+// OVERWRITES existing SMS Inbound/Outbound values (since API-fetched values may be 0).
+function patchSmsFromCSV() {
+  const tz = CONFIG.businessHours.timezone;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ── Read SMS Import sheet ──
+  const importSheet = ss.getSheetByName("SMS Import");
+  if (!importSheet || importSheet.getLastRow() <= 1) {
+    Logger.log("No data in SMS Import sheet"); return;
+  }
+  const importHeaders = importSheet.getRange(1, 1, 1, importSheet.getLastColumn()).getValues()[0].map(h => String(h).trim().toLowerCase());
+  const importData = importSheet.getRange(2, 1, importSheet.getLastRow() - 1, importHeaders.length).getValues();
+
+  // Find column indices by header name
+  const eventIdx = importHeaders.indexOf("event");
+  const dateIdx = importHeaders.indexOf("date");
+  const aircallNumIdx = importHeaders.indexOf("aircall number");
+
+  if (eventIdx < 0 || dateIdx < 0) {
+    Logger.log("SMS Import: could not find required columns (event=" + eventIdx + ", date=" + dateIdx + ")");
+    return;
+  }
+
+  const excludeLines = (CONFIG.excludeSMSLines || []).map(s => s.toLowerCase());
+
+  // ── Aggregate by date ──
+  const byDate = {}; // { "yyyy-MM-dd": { inbound, outbound } }
+
+  importData.forEach(row => {
+    // Parse date
+    const rawTs = row[dateIdx];
+    if (!rawTs) return;
+    const ts = new Date(rawTs);
+    if (isNaN(ts.getTime())) return;
+    const dateStr = Utilities.formatDate(ts, tz, "yyyy-MM-dd");
+
+    // Filter by aircall number line name (everything before the parenthesis)
+    if (aircallNumIdx >= 0) {
+      const rawNum = String(row[aircallNumIdx] || "");
+      const parenPos = rawNum.indexOf("(");
+      const lineName = (parenPos >= 0 ? rawNum.substring(0, parenPos) : rawNum).trim();
+      if (lineName && excludeLines.some(ex => lineName.toLowerCase() === ex)) return;
+    }
+
+    // Count by event type
+    const event = String(row[eventIdx] || "").trim().toLowerCase();
+    if (!byDate[dateStr]) byDate[dateStr] = { inbound: 0, outbound: 0 };
+    if (event === "inbound_message_received") {
+      byDate[dateStr].inbound++;
+    } else if (event === "outbound_message_sent") {
+      byDate[dateStr].outbound++;
+    }
+  });
+
+  // ── Read Daily Metrics Log ──
+  const logSheet = ss.getSheetByName("Daily Metrics Log");
+  if (!logSheet || logSheet.getLastRow() <= 1) { Logger.log("No Daily Metrics Log data"); return; }
+
+  const logHeaders = logSheet.getRange(1, 1, 1, logSheet.getLastColumn()).getValues()[0];
+  const lastRow = logSheet.getLastRow();
+  const logData = logSheet.getRange(2, 1, lastRow - 1, logHeaders.length).getValues();
+
+  const dateCol = logHeaders.indexOf("Date");
+  const smsInCol = logHeaders.indexOf("SMS Inbound");
+  const smsOutCol = logHeaders.indexOf("SMS Outbound");
+
+  if (dateCol < 0 || smsInCol < 0 || smsOutCol < 0) {
+    Logger.log("Daily Metrics Log missing required SMS columns"); return;
+  }
+
+  let patched = 0;
+
+  for (let i = 0; i < logData.length; i++) {
+    const rawDate = logData[i][dateCol];
+    if (!rawDate) continue;
+    const dateStr = rawDate instanceof Date
+      ? Utilities.formatDate(rawDate, tz, "yyyy-MM-dd")
+      : String(rawDate).substring(0, 10);
+    const sheetRow = i + 2;
+    const agg = byDate[dateStr];
+    if (!agg) continue;
+
+    // OVERWRITE SMS columns (existing values are likely 0 from failed API fetch)
+    logSheet.getRange(sheetRow, smsInCol + 1).setValue(agg.inbound);
+    logSheet.getRange(sheetRow, smsOutCol + 1).setValue(agg.outbound);
+    patched++;
+  }
+
+  Logger.log("patchSmsFromCSV complete: " + Object.keys(byDate).length + " dates in CSV, " + patched + " rows patched in Daily Metrics Log");
+}
+
+// ─── SORT, DEDUPE, AND TRIM DAILY METRICS LOG ───
+// Run once after backfill completes. Removes rows before a cutoff date,
+// deduplicates (keeps last row per date), and sorts chronologically.
+function sortAndDedupeMetricsLog() {
+  const CUTOFF_DATE = "2025-12-01"; // Remove all rows before this date
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Daily Metrics Log");
+  if (!sheet || sheet.getLastRow() <= 1) { Logger.log("No data"); return; }
+
+  const tz = CONFIG.businessHours.timezone || Session.getScriptTimeZone();
+  const numCols = METRICS_LOG_HEADERS.length;
+  const lastRow = sheet.getLastRow();
+  const data = sheet.getRange(2, 1, lastRow - 1, numCols).getValues();
+
+  // Normalize dates and build map (last row per date wins)
+  const byDate = {};
+  let removed = 0;
+  let dupes = 0;
+
+  data.forEach(row => {
+    const raw = row[0];
+    if (!raw) return;
+    const dateStr = raw instanceof Date
+      ? Utilities.formatDate(raw, tz, "yyyy-MM-dd")
+      : String(raw).substring(0, 10);
+
+    // Skip rows before cutoff
+    if (dateStr < CUTOFF_DATE) { removed++; return; }
+
+    // Last row per date wins (overwrites earlier dupes)
+    if (byDate[dateStr]) dupes++;
+    byDate[dateStr] = row;
+  });
+
+  // Sort by date
+  const sortedDates = Object.keys(byDate).sort();
+  const sortedRows = sortedDates.map(d => {
+    const row = byDate[d];
+    // Normalize the date cell to string format
+    if (row[0] instanceof Date) {
+      row[0] = Utilities.formatDate(row[0], tz, "yyyy-MM-dd");
+    }
+    return row;
+  });
+
+  // Clear existing data and write sorted/deduped rows
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, numCols).clearContent();
+  }
+  if (sortedRows.length > 0) {
+    sheet.getRange(2, 1, sortedRows.length, numCols).setValues(sortedRows);
+  }
+
+  // Also rewrite headers to ensure they're current
+  sheet.getRange(1, 1, 1, numCols).setValues([METRICS_LOG_HEADERS]);
+  sheet.getRange(1, 1, 1, numCols).setFontWeight("bold").setFontSize(9).setBackground("#E1DFDD");
+
+  Logger.log("Metrics Log cleanup complete: " + removed + " rows before " + CUTOFF_DATE + " removed, " + dupes + " duplicates removed, " + sortedRows.length + " rows remaining (sorted by date)");
+}
+
 // ─── CLEANUP DAILY THEMES LOG ───
 // Run once to deduplicate theme entries. Keeps the LAST set of 3 themes per date
 // (most recent backfill/run), removes earlier duplicates, and sorts by date.
@@ -9139,6 +10414,15 @@ function cleanupDailyThemesLog() {
 // Regenerates a weekly summary email for a specific past week.
 // Set WEEKLY_RERUN_DATE in Script Properties to any date within the target week (e.g., "2026-05-27").
 // Sends to TEST_EMAIL so it doesn't spam the full recipient list.
+// Parse a rerun date from a Script Property into a Date at 5pm local. Tolerant of missing
+// leading zeros (e.g. "2026-06-4"); returns null if unparseable so callers can fail loudly.
+function parseRerunDate_(s) {
+  const m = String(s || "").trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!m) return null;
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 17, 0, 0);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 function rerunWeeklySummary() {
   loadThresholds();
   const props = PropertiesService.getScriptProperties();
@@ -9154,8 +10438,9 @@ function rerunWeeklySummary() {
   }
 
   const tz = CONFIG.businessHours.timezone;
-  // Create a Date object from the target date, treated as if "now" is that Friday
-  const d = new Date(targetDate + "T17:00:00");
+  // Create a Date object from the target date, treated as if "now" is that day at 5pm
+  const d = parseRerunDate_(targetDate);
+  if (!d) { Logger.log("WEEKLY_RERUN_DATE invalid: '" + targetDate + "'. Use YYYY-MM-DD, e.g. 2026-06-05."); return; }
   const thisWeek = getThisWeekRange(d, tz);
   const lastWeek = getLastWeekRange(d, tz);
   Logger.log("Rerunning weekly summary for week containing " + targetDate);
@@ -9217,7 +10502,8 @@ function rerunMonthlySummary() {
     return;
   }
   const tz = CONFIG.businessHours.timezone;
-  const d = new Date(targetDate + "T17:00:00");
+  const d = parseRerunDate_(targetDate);
+  if (!d) { Logger.log("MONTHLY_RERUN_DATE invalid: '" + targetDate + "'. Use YYYY-MM-DD, e.g. 2026-05-15."); return; }
   Logger.log("Rerunning monthly summary for month containing " + targetDate);
   sendMonthlySummary(d, tz, testEmail);
   Logger.log("Monthly rerun sent to " + testEmail);
@@ -9274,19 +10560,21 @@ function setupWeeklyMonthlyTriggers() {
     }
   });
 
-  // Weekly check: daily at 6:15pm — only sends on last working day of week
+  // Weekly check: daily at 7:15pm — a full hour after the 6pm daily recap logs today's row,
+  // so the last working day is present in the log (Apps Script trigger jitter is ~15 min, so a
+  // same-hour gap let the weekly run before the daily had logged Friday).
   ScriptApp.newTrigger("checkAndSendWeeklySummary")
     .timeBased()
-    .atHour(18)
+    .atHour(19)
     .nearMinute(15)
     .everyDays(1)
     .inTimezone("America/Los_Angeles")
     .create();
 
-  // Monthly check: daily at 6:30pm — only sends on last business day of month
+  // Monthly check: daily at 8:30pm — likewise after the daily recap has logged the final day.
   ScriptApp.newTrigger("checkAndSendMonthlySummary")
     .timeBased()
-    .atHour(18)
+    .atHour(20)
     .nearMinute(30)
     .everyDays(1)
     .inTimezone("America/Los_Angeles")
@@ -9387,4 +10675,2089 @@ function formatBizMinutes(min) {
   return Math.round(hours) + "h";
 }
 
+// ─── DEBUG: Find all unique assignees for a date range ───
+// Run manually from the editor. Logs all unique assignee names for tickets solved in the range.
+function debugFindAssignees() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty("ZENDESK_TOKEN");
+  const subdomain = CONFIG.zendesk.subdomain;
+  const auth = "Basic " + Utilities.base64Encode(token);
+  const opts = { method: "get", headers: { "Authorization": auth, "Content-Type": "application/json" }, muteHttpExceptions: true };
 
+  // Check a 2-week window around Jan 15, 2026
+  const startDate = "2026-01-05";
+  const endDate = "2026-01-19";
+  const query = `type:ticket solved>=${startDate} solved<=${endDate} -tags:aircall -tags:internal__testing -tags:auto_close`;
+
+  const assignees = {};
+  let page = 1;
+  let total = 0;
+  while (page <= 10) {
+    const url = `https://${subdomain}.zendesk.com/api/v2/search.json?query=${encodeURIComponent(query)}&per_page=100&page=${page}`;
+    const resp = UrlFetchApp.fetch(url, opts);
+    if (resp.getResponseCode() !== 200) break;
+    const data = JSON.parse(resp.getContentText());
+    const results = data.results || [];
+    if (results.length === 0) break;
+    total += results.length;
+    results.forEach(t => {
+      const name = t.assignee_id ? (t.via && t.via.source && t.via.source.from && t.via.source.from.name) || "ID:" + t.assignee_id : "Unassigned";
+      // We need the actual assignee name - fetch from the ticket's assignee field if available
+      const assignee = t.assignee || t.submitter || "";
+      // The search API doesn't return assignee name directly - we need to collect IDs
+      if (t.assignee_id) assignees[t.assignee_id] = (assignees[t.assignee_id] || 0) + 1;
+    });
+    if (results.length < 100) break;
+    page++;
+  }
+
+  Logger.log("Total tickets solved " + startDate + " to " + endDate + ": " + total);
+  Logger.log("Unique assignee IDs: " + Object.keys(assignees).length);
+
+  // Now resolve the IDs to names
+  const ids = Object.keys(assignees);
+  for (let i = 0; i < ids.length; i += 100) {
+    const batch = ids.slice(i, i + 100).join(",");
+    try {
+      const url = `https://${subdomain}.zendesk.com/api/v2/users/show_many.json?ids=${batch}`;
+      const resp = UrlFetchApp.fetch(url, opts);
+      if (resp.getResponseCode() === 200) {
+        const users = JSON.parse(resp.getContentText()).users || [];
+        users.forEach(u => {
+          Logger.log("  " + u.name + " (ID: " + u.id + ") - " + assignees[u.id] + " tickets solved");
+        });
+      }
+    } catch (e) { Logger.log("User lookup error: " + e); }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// QBR MONTHLY SUMMARY  (added v2.5.51)
+// One reliable place for the 6-month review numbers. Computes monthly rollups
+// from the Daily Metrics Log with CORRECT aggregation so they cannot drift from
+// an ad-hoc CSV analysis:
+//   - Volume ............ summed
+//   - Answer rate ....... POOLED:  sum(answered) / sum(answered + forwarded)   NOT avg of daily %
+//   - CSAT .............. POOLED:  sum(satisfied) / sum(responses)             NOT avg of daily %
+//                         shown at BOTH scopes: all agents and the core roster (CONFIG.agents)
+//   - NPS ............... response-weighted average of daily values (best the log allows)
+//   - CES ............... average of daily values
+//   - FRT / Resolution .. NOT taken from the daily log. A median of daily medians is not a
+//                         real median, which is what produced an agent's bad numbers. Instead,
+//                         recomputeQbrResponseTimes() pulls true monthly average AND median
+//                         from Zendesk per-ticket business-hours metrics.
+//
+// Run order:
+//   1. recomputeQbrResponseTimes()  -> run until it logs "complete" (resumable, ~1-2 runs)
+//   2. buildQbrSummary()            -> writes / refreshes the "QBR Summary" tab
+// buildQbrSummary() also works on its own; FRT/Resolution rows show "-" until recompute runs.
+// ════════════════════════════════════════════════════════════════════════════
+
+function qbrMonthsFromLog() {
+  const all = readMetricsLog("2000-01-01", "2999-12-31");
+  const set = {};
+  all.forEach(r => { const k = (r._dateStr || "").substring(0, 7); if (k) set[k] = true; });
+  return Object.keys(set).sort();
+}
+
+function qbrMonthLabel(ym) {
+  const parts = ym.split("-");
+  const d = new Date(Number(parts[0]), Number(parts[1]) - 1, 1);
+  return Utilities.formatDate(d, CONFIG.businessHours.timezone, "MMM yyyy");
+}
+
+function buildQbrSummary() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const all = readMetricsLog("2000-01-01", "2999-12-31");
+  if (all.length === 0) { Logger.log("QBR Summary: no Daily Metrics Log data found."); return; }
+
+  const months = qbrMonthsFromLog();
+  const byMonth = {};
+  months.forEach(m => byMonth[m] = []);
+  all.forEach(r => { const k = (r._dateStr || "").substring(0, 7); if (byMonth[k]) byMonth[k].push(r); });
+
+  // Stored Zendesk response-time results (written by recomputeQbrResponseTimes)
+  let rt = {};
+  try { rt = JSON.parse(PropertiesService.getScriptProperties().getProperty("QBR_RT_RESULTS") || "{}"); } catch (e) { rt = {}; }
+
+  // ── aggregation helpers ──
+  const sum = (rows, key) => rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
+  function pooledPct(rows, satKey, totKey) {
+    const s = sum(rows, satKey), t = sum(rows, totKey);
+    return t > 0 ? Math.round(s / t * 1000) / 10 : "";
+  }
+  function pooledPctMulti(rows, satKeys, totKeys) {
+    let s = 0, t = 0;
+    satKeys.forEach(k => s += sum(rows, k));
+    totKeys.forEach(k => t += sum(rows, k));
+    return t > 0 ? Math.round(s / t * 1000) / 10 : "";
+  }
+  // Phone CSAT all-agents: the log stores a daily % and response count but no satisfied
+  // count, so reconstruct satisfied ~= round(% / 100 * responses) per day, then pool.
+  function phonePooledAll(rows) {
+    let s = 0, t = 0;
+    rows.forEach(r => {
+      const pct = Number(r["Phone CSAT %"]), resp = Number(r["Phone CSAT Responses"]) || 0;
+      if (r["Phone CSAT %"] !== "" && !isNaN(pct) && resp > 0) { s += Math.round(pct / 100 * resp); t += resp; }
+    });
+    return t > 0 ? Math.round(s / t * 1000) / 10 : "";
+  }
+  // Combined CSAT: email + phone pooled across both channels, weighted by response volume.
+  // Phone has no satisfied-count column, so reconstruct phone satisfied from % x responses per day.
+  function combinedCsat(rows) {
+    let sat = sum(rows, "Email CSAT Satisfied");
+    let resp = sum(rows, "Email CSAT Responses");
+    rows.forEach(r => {
+      const pct = Number(r["Phone CSAT %"]), pr = Number(r["Phone CSAT Responses"]) || 0;
+      if (r["Phone CSAT %"] !== "" && !isNaN(pct) && pr > 0) { sat += Math.round(pct / 100 * pr); resp += pr; }
+    });
+    return resp > 0 ? Math.round(sat / resp * 1000) / 10 : "";
+  }
+  // Combined NPS: email + phone NPS pooled across both channels, weighted by survey response
+  // volume. CSAT Responses is the per-day weight, since the log has no separate NPS response
+  // count and PostCall/Nicereply ask CSAT and NPS in the same survey (so volumes track closely).
+  function combinedNps(rows) {
+    let num = 0, den = 0;
+    rows.forEach(r => {
+      const en = Number(r["Email NPS"]), ew = Number(r["Email CSAT Responses"]) || 0;
+      if (r["Email NPS"] !== "" && r["Email NPS"] !== null && r["Email NPS"] !== undefined && !isNaN(en) && ew > 0) { num += en * ew; den += ew; }
+      const pn = Number(r["Phone NPS"]), pw = Number(r["Phone CSAT Responses"]) || 0;
+      if (r["Phone NPS"] !== "" && r["Phone NPS"] !== null && r["Phone NPS"] !== undefined && !isNaN(pn) && pw > 0) { num += pn * pw; den += pw; }
+    });
+    return den > 0 ? Math.round(num / den * 10) / 10 : "";
+  }
+  function weightedAvg(rows, valKey, wKey) {
+    let num = 0, den = 0;
+    rows.forEach(r => {
+      const v = Number(r[valKey]), w = Number(r[wKey]) || 0;
+      if (r[valKey] !== "" && r[valKey] !== null && r[valKey] !== undefined && !isNaN(v) && w > 0) { num += v * w; den += w; }
+    });
+    return den > 0 ? Math.round(num / den * 10) / 10 : "";
+  }
+  function avgVal(rows, key) {
+    const vals = rows.map(r => r[key]).filter(v => v !== "" && v !== null && v !== undefined).map(Number).filter(v => !isNaN(v));
+    return vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length * 10) / 10 : "";
+  }
+  const rtVal = (m, field) => (rt[m] && rt[m][field] !== undefined && rt[m][field] !== null && rt[m][field] !== "") ? rt[m][field] : "-";
+
+  const emailSat3 = CONFIG.agents.map(a => "Email CSAT Sat: " + a.split(" ")[0]);
+  const emailTot3 = CONFIG.agents.map(a => "Email CSAT Tot: " + a.split(" ")[0]);
+  const phoneSat3 = CONFIG.agents.map(a => "Phone CSAT Sat: " + a.split(" ")[0]);
+  const phoneTot3 = CONFIG.agents.map(a => "Phone CSAT Tot: " + a.split(" ")[0]);
+
+  const M = months;
+  const sixSum = (key) => sum(all, key);
+  const rows = [];
+  const sectionRows = [];
+  const section = (label) => { sectionRows.push(rows.length); rows.push([label, ...M.map(() => ""), ""]); };
+
+  rows.push(["Metric", ...M.map(qbrMonthLabel), "6-Mo Total / Avg"]);
+
+  section("VOLUME (counts summed)");
+  rows.push(["Tickets Created",   ...M.map(m => sum(byMonth[m], "Tickets Created")),  sixSum("Tickets Created")]);
+  rows.push(["Tickets Solved",    ...M.map(m => sum(byMonth[m], "Solved Total")),     sixSum("Solved Total")]);
+  rows.push(["Inbound Answered",  ...M.map(m => sum(byMonth[m], "Inbound Calls")),    sixSum("Inbound Calls")]);
+  rows.push(["Forwarded to SAS",  ...M.map(m => sum(byMonth[m], "Forwarded to SAS")), sixSum("Forwarded to SAS")]);
+  rows.push(["Outbound Calls",    ...M.map(m => sum(byMonth[m], "Outbound Calls")),   sixSum("Outbound Calls")]);
+  rows.push(["SMS Inbound",       ...M.map(m => sum(byMonth[m], "SMS Inbound")),      sixSum("SMS Inbound")]);
+  rows.push(["SMS Outbound",      ...M.map(m => sum(byMonth[m], "SMS Outbound")),     sixSum("SMS Outbound")]);
+
+  section("ANSWER RATE (pooled, working days only: sum answered / sum(answered+forwarded))");
+  // Working days only: a non-blank Answer Rate % marks a working day (weekends/holidays are
+  // blanked). This keeps non-working SAS volume (e.g. closure-week calls) out of the rate.
+  const workRows = (rs) => rs.filter(r => { const v = r["Answer Rate %"]; return v !== "" && v !== null && v !== undefined; });
+  const arRow = ["Answer Rate %"];
+  M.forEach(m => { const w = workRows(byMonth[m]); const a = sum(w, "Inbound Calls"), f = sum(w, "Forwarded to SAS"); arRow.push((a + f) > 0 ? Math.round(a / (a + f) * 1000) / 10 : ""); });
+  (function () { const w = workRows(all); const a = sum(w, "Inbound Calls"), f = sum(w, "Forwarded to SAS"); arRow.push((a + f) > 0 ? Math.round(a / (a + f) * 1000) / 10 : ""); })();
+  rows.push(arRow);
+
+  section("SATISFACTION (pooled: sum satisfied / sum responses)");
+  // CSAT is reported all-agents only. Per-agent (core-3) CSAT is NOT reliable in the daily
+  // log (per-agent columns are sparse and occasionally have satisfied > total), so core-3
+  // must come from the raw PostCall/Nicereply survey export, not this sheet.
+  rows.push(["Combined CSAT % (weighted)", ...M.map(m => combinedCsat(byMonth[m])), combinedCsat(all)]);
+  rows.push(["Email CSAT % (all agents)", ...M.map(m => pooledPct(byMonth[m], "Email CSAT Satisfied", "Email CSAT Responses")), pooledPct(all, "Email CSAT Satisfied", "Email CSAT Responses")]);
+  rows.push(["Email CSAT Responses",      ...M.map(m => sum(byMonth[m], "Email CSAT Responses")), sixSum("Email CSAT Responses")]);
+  rows.push(["Phone CSAT % (all agents)", ...M.map(m => phonePooledAll(byMonth[m])), phonePooledAll(all)]);
+  rows.push(["Phone CSAT Responses",      ...M.map(m => sum(byMonth[m], "Phone CSAT Responses")), sixSum("Phone CSAT Responses")]);
+  rows.push(["Combined NPS (wtd)",    ...M.map(m => combinedNps(byMonth[m])), combinedNps(all)]);
+  rows.push(["Email NPS (wtd)",       ...M.map(m => weightedAvg(byMonth[m], "Email NPS", "Email CSAT Responses")), weightedAvg(all, "Email NPS", "Email CSAT Responses")]);
+  rows.push(["Phone NPS (wtd)",       ...M.map(m => weightedAvg(byMonth[m], "Phone NPS", "Phone CSAT Responses")), weightedAvg(all, "Phone NPS", "Phone CSAT Responses")]);
+  rows.push(["CES (avg)",             ...M.map(m => avgVal(byMonth[m], "CES")), avgVal(all, "CES")]);
+
+  section("RESPONSE TIMES (biz hrs, true median+avg from Zendesk; run recomputeQbrResponseTimes)");
+  rows.push(["Avg FRT (hrs)",           ...M.map(m => rtVal(m, "avgFrt")), ""]);
+  rows.push(["Median FRT (hrs)",        ...M.map(m => rtVal(m, "medFrt")), ""]);
+  rows.push(["Avg Resolution (hrs)",    ...M.map(m => rtVal(m, "avgRes")), ""]);
+  rows.push(["Median Resolution (hrs)", ...M.map(m => rtVal(m, "medRes")), ""]);
+  rows.push(["Tickets in FRT/Res calc", ...M.map(m => rtVal(m, "n")), ""]);
+
+  // ── write to sheet ──
+  let sheet = ss.getSheetByName("QBR Summary");
+  if (!sheet) sheet = ss.insertSheet("QBR Summary");
+  sheet.clear();
+  const nCols = M.length + 2;
+  sheet.getRange(1, 1, rows.length, nCols).setValues(rows);
+
+  sheet.getRange(1, 1, 1, nCols).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(1);
+  sheet.getRange(1, 1, rows.length, 1).setFontWeight("bold");
+  sectionRows.forEach(idx => sheet.getRange(idx + 1, 1, 1, nCols).setFontWeight("bold").setBackground("#E1DFDD"));
+  sheet.autoResizeColumns(1, nCols);
+
+  const stamp = Utilities.formatDate(new Date(), CONFIG.businessHours.timezone, "yyyy-MM-dd HH:mm");
+  sheet.getRange(rows.length + 2, 1).setValue("Built " + stamp + " - CS Visibility v2.5.64 - Source: Daily Metrics Log (pooled) + Zendesk (FRT/Resolution)");
+  sheet.getRange(rows.length + 3, 1).setValue("Method: rates and CSAT pooled from raw counts (all agents, not averages of daily values); FRT/Resolution are true median+avg from Zendesk. Core-3 (per-agent) CSAT is not reliably in the daily log - pull from the PostCall/Nicereply survey export if the deck needs it.");
+
+  Logger.log("QBR Summary built: " + months.length + " months, " + rows.length + " rows.");
+  try { ss.toast("QBR Summary tab refreshed", "Done", 5); } catch (e) {}
+}
+
+// Resumable: computes TRUE monthly average + median FRT and Resolution (business hrs)
+// from Zendesk per-ticket metrics and stores them in Script Property QBR_RT_RESULTS.
+// Processes months until ~4.5 min elapsed, then stops; just run it again to continue.
+// Run resetQbrResponseTimes() to start over from scratch.
+function recomputeQbrResponseTimes() {
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+  const subdomain = CONFIG.zendesk.subdomain;
+  const token = props.getProperty("ZENDESK_TOKEN");
+  if (!token) { Logger.log("recomputeQbrResponseTimes: ZENDESK_TOKEN not set."); return; }
+  const zdOpts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(token), "Content-Type": "application/json" }, muteHttpExceptions: true };
+  const solvedFilter = '-tags:aircall -tags:internal__testing -tags:auto_close -assignee:"AI Agent"';
+
+  const months = qbrMonthsFromLog();
+  let results = {};
+  try { results = JSON.parse(props.getProperty("QBR_RT_RESULTS") || "{}"); } catch (e) { results = {}; }
+
+  const start = Date.now();
+  const GUARD_MS = 4.5 * 60 * 1000;
+
+  for (let mi = 0; mi < months.length; mi++) {
+    const ym = months[mi];
+    if (results[ym]) continue;
+    if (Date.now() - start > GUARD_MS) {
+      props.setProperty("QBR_RT_RESULTS", JSON.stringify(results));
+      Logger.log("Time guard hit; progress saved. Run recomputeQbrResponseTimes() again. Remaining: " + months.filter(m => !results[m]).join(", "));
+      return;
+    }
+
+    const parts = ym.split("-");
+    const year = Number(parts[0]), mon = Number(parts[1]);
+    const lastDay = new Date(year, mon, 0).getDate();
+    const ids = [];
+    // Loop days to avoid Zendesk's 1000-result search cap on a whole month
+    for (let d = 1; d <= lastDay; d++) {
+      const dayStr = year + "-" + String(mon).padStart(2, "0") + "-" + String(d).padStart(2, "0");
+      const nextStr = Utilities.formatDate(new Date(new Date(dayStr + "T12:00:00").getTime() + 86400000), tz, "yyyy-MM-dd");
+      let page = 1, hasMore = true;
+      while (hasMore && page <= 5) {
+        const q = "type:ticket solved>=" + dayStr + " solved<" + nextStr + " " + solvedFilter;
+        const url = "https://" + subdomain + ".zendesk.com/api/v2/search.json?query=" + encodeURIComponent(q) + "&per_page=100&page=" + page + "&sort_by=created_at&sort_order=desc";
+        const resp = UrlFetchApp.fetch(url, zdOpts);
+        if (resp.getResponseCode() === 200) {
+          const data = JSON.parse(resp.getContentText());
+          const res = data.results || [];
+          res.forEach(t => ids.push(t.id));
+          hasMore = res.length === 100;
+          page++;
+        } else { hasMore = false; }
+      }
+    }
+
+    const m = fetchTicketResponseMetrics(ids, zdOpts, subdomain);
+    results[ym] = { avgFrt: m.avgFrt, medFrt: m.medianFrt, avgRes: m.avgResolution, medRes: m.medianResolution, n: ids.length };
+    props.setProperty("QBR_RT_RESULTS", JSON.stringify(results));
+    Logger.log(ym + ": " + ids.length + " tickets | avgFRT=" + m.avgFrt + "h medFRT=" + m.medianFrt + "h avgRes=" + m.avgResolution + "h medRes=" + m.medianResolution + "h");
+  }
+
+  Logger.log("recomputeQbrResponseTimes complete. Months done: " + Object.keys(results).length + ". Now run buildQbrSummary().");
+}
+
+function resetQbrResponseTimes() {
+  PropertiesService.getScriptProperties().deleteProperty("QBR_RT_RESULTS");
+  Logger.log("QBR_RT_RESULTS cleared. Next recomputeQbrResponseTimes() run starts fresh.");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// THROUGHPUT PER AVAILABLE HOUR  (added v2.5.51) - writes its own "Throughput" tab
+// Fair, channel-split productivity: contacts handled / available working hours, per agent
+// per working day. Output (calls + tickets solved) comes from the Daily Metrics Log. The
+// available-hours denominator = scheduled day, minus Google Calendar time (PTO, meetings,
+// project blocks), minus lunch (calendar if logged, else a fixed fallback), minus fixed breaks.
+//
+// SETUP: put each agent's real email below (that IS their Google Calendar ID), and tune
+// lunchMins / breakMins after eyeballing real days. The account the script runs as must have
+// read access to those calendars (same Workspace). If a calendar can't be read, that agent's
+// rows still compute, just without the calendar subtraction (logged as a warning).
+//
+// NOTE (v1 simplifications to revisit): an all-day event = full day off (PTO); any timed event
+// that day is treated as off-contact time and subtracted in full (not yet clipped to 6a-5p, so
+// after-hours personal events would over-subtract); "lunch" is detected by the word in the title.
+// Schedules are day-of-week aware: 8h on each working weekday, off on non-working ones. An agent
+// on a 4x8 week (one weekday off) uses two date-effective entries with different workdays; see
+// the CS_THROUGHPUT_AGENTS example above for the JSON shape.
+// ════════════════════════════════════════════════════════════════════════════
+const THROUGHPUT_CONFIG = {
+  lunchMins: 60,   // fallback used ONLY when no "lunch" event is on the calendar that day
+  breakMins: 30,   // fixed (2x15); breaks are not calendared
+  assumeOffFloor: 3,   // a working day with no real meeting and <= this many contacts is treated as a full day off (uncaptured PTO); agents are in/out for whole days
+  // Per agent: email (= Google Calendar ID) and a date-effective schedule.
+  // dailyHours = hours per working day; workdays = weekday numbers worked (Mon=1 .. Fri=5).
+  // The latest entry whose 'from' is on/before the date wins.
+  // Loaded from the CS_THROUGHPUT_AGENTS Script Property (JSON) so no names/emails/schedules
+  // are hardcoded. Example value:
+  //   {"Jane Doe":{"email":"jane@example.com","schedule":[{"from":"2000-01-01","dailyHours":8,"workdays":[1,2,3,4,5]}]}}
+  agents: (function () {
+    try {
+      return JSON.parse(PropertiesService.getScriptProperties().getProperty("CS_THROUGHPUT_AGENTS") || "{}");
+    } catch (e) {
+      Logger.log("CS_THROUGHPUT_AGENTS is not valid JSON — using empty roster: " + e);
+      return {};
+    }
+  })(),
+};
+
+function thrScheduledHours(schedule, dateStr, dow) {
+  let entry = null;
+  schedule.forEach(s => { if (dateStr >= s.from) entry = s; });   // latest effective entry wins
+  if (!entry) return 0;
+  return entry.workdays.indexOf(dow) >= 0 ? entry.dailyHours : 0;  // 0 = not a working day for this agent
+}
+
+// All-day events count as a day off ONLY if the title matches PTO. This keeps Google "Working
+// Location" entries (Home/Office), birthdays, and other all-day banners from being misread as a
+// full day off. Extend this list if agents label PTO differently.
+const THROUGHPUT_PTO_RE = /\b(pto|vacation|vac|ooo|out of office|out of the office|holiday|sick|leave|bereavement|jury|day off|time off|unavailable)\b/i;
+
+function buildThroughput() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = CONFIG.businessHours.timezone;
+  const rows = readMetricsLog("2000-01-01", "2999-12-31");
+  if (rows.length === 0) { Logger.log("Throughput: no Daily Metrics Log data"); return; }
+
+  const dates = rows.map(r => r._dateStr).filter(Boolean).sort();
+  const rangeStart = new Date(dates[0] + "T00:00:00");
+  const rangeEnd = new Date(dates[dates.length - 1] + "T23:59:59");
+  const holidays = getDeakoHolidays();
+
+  // Slack-confirmed time off ("Time Off (Slack)" sheet): key "FullName|yyyy-MM-dd". A layer between
+  // calendar PTO and the activity floor (priority: calendar > Slack > assumed-off).
+  const slackOff = new Set();
+  try {
+    const soSheet = ss.getSheetByName("Time Off (Slack)");
+    if (soSheet && soSheet.getLastRow() > 1) {
+      soSheet.getRange(2, 1, soSheet.getLastRow() - 1, 2).getValues().forEach(r => {
+        if (!r[0] || !r[1]) return;
+        const d = (r[1] instanceof Date) ? Utilities.formatDate(r[1], tz, "yyyy-MM-dd") : String(r[1]).substring(0, 10);
+        slackOff.add(String(r[0]).trim() + "|" + d);
+      });
+    }
+  } catch (e) { Logger.log("Throughput: Time Off (Slack) read failed: " + e); }
+
+  // Pre-fetch each agent's calendar events for the whole range (one read per agent), bucket by Pacific day
+  const calByAgentDay = {};
+  Object.keys(THROUGHPUT_CONFIG.agents).forEach(name => {
+    calByAgentDay[name] = {};
+    const email = THROUGHPUT_CONFIG.agents[name].email;
+    let cal = null;
+    try { cal = CalendarApp.getCalendarById(email); } catch (e) { cal = null; }
+    if (!cal) { Logger.log("Throughput: cannot access calendar for " + name + " (" + email + ") - rows will compute without calendar subtraction"); return; }
+    let events = [];
+    try { events = cal.getEvents(rangeStart, rangeEnd); } catch (e) { Logger.log("Throughput: getEvents failed for " + name + ": " + e); }
+    const bizStart = CONFIG.businessHours.startHour * 60, bizEnd = CONFIG.businessHours.endHour * 60;
+    events.forEach(ev => {
+      const start = ev.getStartTime();
+      const dayKey = Utilities.formatDate(start, tz, "yyyy-MM-dd");
+      const title = (ev.getTitle() || "").toLowerCase();
+      if (ev.isAllDayEvent()) {
+        // Only PTO-titled all-day events are a day off; ignore Working Location, birthdays, etc.
+        if (THROUGHPUT_PTO_RE.test(title)) {
+          (calByAgentDay[name][dayKey] = calByAgentDay[name][dayKey] || []).push({ pto: true, mins: 0, isLunch: false });
+        }
+        return;
+      }
+      // Timed event: count only the portion overlapping business hours (6a-5p Pacific)
+      const sMin = Number(Utilities.formatDate(start, tz, "HH")) * 60 + Number(Utilities.formatDate(start, tz, "mm"));
+      const eMin = Number(Utilities.formatDate(ev.getEndTime(), tz, "HH")) * 60 + Number(Utilities.formatDate(ev.getEndTime(), tz, "mm"));
+      const mins = Math.max(0, Math.min(eMin, bizEnd) - Math.max(sMin, bizStart));
+      if (mins > 0) (calByAgentDay[name][dayKey] = calByAgentDay[name][dayKey] || []).push({ pto: false, mins: mins, isLunch: title.indexOf("lunch") >= 0 });
+    });
+  });
+
+  const out = [["Date", "Agent", "Sched hrs", "Cal off (hrs)", "Lunch+Break (hrs)", "Avail hrs", "Calls", "Tickets", "Calls/hr", "Tickets/hr", "Contacts/hr", "Note"]];
+  rows.forEach(r => {
+    const dateStr = r._dateStr;
+    if (!dateStr) return;
+    const dt = new Date(dateStr + "T12:00:00");
+    if (isNonWorkingDay(dt, holidays)) return;   // skip weekends/holidays
+    Object.keys(THROUGHPUT_CONFIG.agents).forEach(name => {
+      const cfg = THROUGHPUT_CONFIG.agents[name];
+      const first = name.split(" ")[0];
+      const calls = (Number(r["In: " + first]) || 0) + (Number(r["Out: " + first]) || 0);
+      const tickets = Number(r["Solved: " + first]) || 0;
+      const sched = thrScheduledHours(cfg.schedule, dateStr, dt.getDay());
+      if (sched <= 0) return;   // agent's own non-working weekday - skip
+      const evs = (calByAgentDay[name] && calByAgentDay[name][dateStr]) || [];
+      const allDayOff = evs.some(e => e.pto);
+      const hasRealMeeting = evs.some(e => !e.pto && !e.isLunch && e.mins > 0);
+      let availHrs, calOffHrs, lbHrs, note = "";
+      if (allDayOff) {
+        availHrs = 0; calOffHrs = Math.round(sched * 100) / 100; lbHrs = 0; note = "PTO (calendar)";
+      } else if (slackOff.has(name + "|" + dateStr)) {
+        availHrs = 0; calOffHrs = Math.round(sched * 100) / 100; lbHrs = 0; note = "PTO (Slack)";
+      } else {
+        const calOffMins = evs.filter(e => !e.pto).reduce((s, e) => s + e.mins, 0);
+        const hadLunch = evs.some(e => e.isLunch);
+        const lbMins = (hadLunch ? 0 : THROUGHPUT_CONFIG.lunchMins) + THROUGHPUT_CONFIG.breakMins;
+        calOffHrs = Math.round(calOffMins / 60 * 100) / 100;
+        lbHrs = Math.round(lbMins / 60 * 100) / 100;
+        availHrs = Math.max(0, Math.round((sched - calOffMins / 60 - lbMins / 60) * 100) / 100);
+        // Fallback PTO: no real meeting + at/below the contacts floor => treat as a full day off
+        // (uncaptured PTO). Calendar PTO above always wins. Agents are in/out for whole days.
+        if (!hasRealMeeting && (calls + tickets) <= THROUGHPUT_CONFIG.assumeOffFloor) {
+          availHrs = 0; calOffHrs = Math.round(sched * 100) / 100; lbHrs = 0; note = "assumed off (no activity)";
+        }
+      }
+      const perHr = (n) => availHrs > 0 ? Math.round(n / availHrs * 100) / 100 : "";
+      out.push([dateStr, name, Math.round(sched * 100) / 100, calOffHrs, lbHrs, availHrs, calls, tickets, perHr(calls), perHr(tickets), perHr(calls + tickets), note]);
+    });
+  });
+
+  let sheet = ss.getSheetByName("Throughput");
+  if (!sheet) sheet = ss.insertSheet("Throughput");
+  sheet.clear();
+  sheet.getRange(1, 1, out.length, out[0].length).setValues(out);
+  sheet.getRange(1, 1, 1, out[0].length).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.setFrozenRows(1);
+  sheet.autoResizeColumns(1, out[0].length);
+  const stamp = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm");
+  sheet.getRange(out.length + 2, 1).setValue("Built " + stamp + " - CS Visibility v2.5.64 - throughput per available working hour.");
+  sheet.getRange(out.length + 3, 1).setValue("Available hours = scheduled day - calendar PTO/meetings (clipped to 6a-5p) - lunch (calendar event or " + THROUGHPUT_CONFIG.lunchMins + "m fallback) - " + THROUGHPUT_CONFIG.breakMins + "m breaks.");
+  sheet.getRange(out.length + 4, 1).setValue("Note 'assumed off (no activity)': a working day with no real meeting and <= " + THROUGHPUT_CONFIG.assumeOffFloor + " contacts is treated as a full day off and excluded from the rate (uncaptured PTO; agents are in/out for whole days). Priority: calendar PTO > Slack-confirmed (the Time Off (Slack) sheet, shown as 'PTO (Slack)') > this activity floor. Add PTO to the calendar or the Slack sheet to override.");
+  Logger.log("Throughput built: " + (out.length - 1) + " agent-day rows across " + Object.keys(THROUGHPUT_CONFIG.agents).length + " agents.");
+}
+
+// Diagnostic: run this to find out WHY calendars aren't readable. It distinguishes a missing
+// Calendar permission (own calendar fails) from a sharing problem (own works, agents are null).
+function testCalAccess() {
+  try {
+    const me = CalendarApp.getDefaultCalendar();
+    Logger.log("OWN calendar OK: '" + me.getName() + "' -> the Calendar permission/scope IS granted.");
+  } catch (e) {
+    Logger.log("OWN calendar FAILED: " + e + "  -> Calendar permission is NOT granted. Re-run from the editor and accept the Google Calendar prompt.");
+    return;
+  }
+  Object.keys(THROUGHPUT_CONFIG.agents).forEach(name => {
+    const email = THROUGHPUT_CONFIG.agents[name].email;
+    let c = null;
+    try { c = CalendarApp.getCalendarById(email); } catch (e) { Logger.log(name + " (" + email + "): ERROR " + e); return; }
+    if (c) {
+      const n = c.getEvents(new Date(Date.now() - 7 * 86400000), new Date()).length;
+      Logger.log(name + " (" + email + "): ACCESSIBLE, '" + c.getName() + "', " + n + " events in last 7 days.");
+    } else {
+      Logger.log(name + " (" + email + "): NULL -> not shared with you at 'See all event details' (free/busy is not enough).");
+    }
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// THROUGHPUT ROLLUP  (added v2.5.51) - writes its own "Throughput Rollup" tab
+// Reads the per-day "Throughput" tab and pools it into per-agent MONTHLY and per-agent WEEKLY
+// views, normalized by available working hours (calls/hr, tickets/hr, contacts/hr). Because it
+// pools available hours, a vacation or short day does not unfairly drag an agent's rate. Run
+// buildThroughput() first, then this. Re-run both after the manager trues up the calendars.
+// ════════════════════════════════════════════════════════════════════════════
+function buildThroughputRollup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = CONFIG.businessHours.timezone;
+  const src = ss.getSheetByName("Throughput");
+  if (!src || src.getLastRow() <= 1) { Logger.log("Throughput Rollup: run buildThroughput() first - no Throughput tab."); return; }
+  const data = src.getDataRange().getValues();
+  const hdr = data[0];
+  const c = {};
+  ["Date", "Agent", "Avail hrs", "Calls", "Tickets"].forEach(k => c[k] = hdr.indexOf(k));
+  if (c["Date"] < 0 || c["Avail hrs"] < 0) { Logger.log("Throughput Rollup: expected columns not found on Throughput tab."); return; }
+
+  const month = {}, week = {};
+  const add = (bucket, key, agent, label, avail, calls, tickets) => {
+    const b = bucket[key] || (bucket[key] = { agent: agent, label: label, days: 0, avail: 0, calls: 0, tickets: 0 });
+    b.days++; b.avail += avail; b.calls += calls; b.tickets += tickets;
+  };
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const dRaw = row[c["Date"]];
+    if (!dRaw) continue;
+    const dateStr = (dRaw instanceof Date) ? Utilities.formatDate(dRaw, tz, "yyyy-MM-dd") : String(dRaw).substring(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) continue;   // skip footer/non-data rows
+    const agent = String(row[c["Agent"]] || ""); if (!agent) continue;
+    const avail = Number(row[c["Avail hrs"]]) || 0;
+    if (avail <= 0) continue;   // skip PTO / assumed-off days - not working days
+    const calls = Number(row[c["Calls"]]) || 0;
+    const tickets = Number(row[c["Tickets"]]) || 0;
+    const dt = new Date(dateStr + "T12:00:00");
+    const monday = new Date(dt.getTime() - (dt.getDay() - 1) * 86400000);
+    const weekKey = Utilities.formatDate(monday, tz, "yyyy-MM-dd");
+    add(month, agent + "|" + dateStr.substring(0, 7), agent, dateStr.substring(0, 7), avail, calls, tickets);
+    add(week, agent + "|" + weekKey, agent, "Wk of " + weekKey, avail, calls, tickets);
+  }
+
+  const rate = (n, av) => av > 0 ? Math.round(n / av * 100) / 100 : "";
+  const cols = ["Agent", "Period", "Working days", "Avail hrs", "Calls", "Tickets", "Calls/hr", "Tickets/hr", "Contacts/hr"];
+  const blank = ["", "", "", "", "", "", "", "", ""];
+  const sortKeys = (bucket) => Object.keys(bucket).sort((a, b) => bucket[a].label === bucket[b].label ? bucket[a].agent.localeCompare(bucket[b].agent) : bucket[a].label.localeCompare(bucket[b].label));
+  const rowsFor = (bucket) => sortKeys(bucket).map(k => { const b = bucket[k]; return [b.agent, b.label, b.days, Math.round(b.avail * 10) / 10, b.calls, b.tickets, rate(b.calls, b.avail), rate(b.tickets, b.avail), rate(b.calls + b.tickets, b.avail)]; });
+
+  // ── Contacts/hr matrix: agents x months + cumulative Total (the headline comparison view) ──
+  const allMonths = Array.from(new Set(Object.values(month).map(b => b.label))).sort();
+  const allAgents = Array.from(new Set(Object.values(month).map(b => b.agent))).sort();
+  const mLabel = (ym) => { const p = ym.split("-"); return Utilities.formatDate(new Date(Number(p[0]), Number(p[1]) - 1, 1), tz, "MMM yyyy"); };
+
+  const out = [];
+  const matrixHeaderRow = out.length;
+  out.push(["CONTACTS/HR BY MONTH (pooled, normalized by available hours)"]);
+  out.push(["Agent"].concat(allMonths.map(mLabel)).concat(["Total"]));
+  allAgents.forEach(a => {
+    let tc = 0, tt = 0, ta = 0;
+    const cells = allMonths.map(m => {
+      const b = month[a + "|" + m];
+      if (!b) return "-";
+      tc += b.calls; tt += b.tickets; ta += b.avail;
+      return b.avail > 0 ? Math.round((b.calls + b.tickets) / b.avail * 100) / 100 : "-";
+    });
+    out.push([a].concat(cells).concat([ta > 0 ? Math.round((tc + tt) / ta * 100) / 100 : "-"]));   // Total = period contacts / period avail hrs
+  });
+  out.push(blank);
+
+  const monthHeaderRow = out.length;
+  out.push(["MONTHLY DETAIL (per agent, pooled)"]);
+  out.push(cols);
+  rowsFor(month).forEach(r => out.push(r));
+  out.push(blank);
+  const weekHeaderRow = out.length;
+  out.push(["WEEKLY DETAIL (per agent, pooled)"]);
+  out.push(cols);
+  rowsFor(week).forEach(r => out.push(r));
+
+  // Pad every row to a common width (the matrix and the detail sections differ in column count)
+  const maxCols = out.reduce((m, r) => Math.max(m, r.length), 0);
+  out.forEach(r => { while (r.length < maxCols) r.push(""); });
+
+  let sheet = ss.getSheetByName("Throughput Rollup");
+  if (!sheet) sheet = ss.insertSheet("Throughput Rollup");
+  sheet.clear();
+  sheet.getRange(1, 1, out.length, maxCols).setValues(out);
+  [matrixHeaderRow, monthHeaderRow, weekHeaderRow].forEach(idx => sheet.getRange(idx + 1, 1, 1, maxCols).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF"));
+  [matrixHeaderRow, monthHeaderRow, weekHeaderRow].forEach(idx => sheet.getRange(idx + 2, 1, 1, maxCols).setFontWeight("bold").setBackground("#E1DFDD"));
+  sheet.setFrozenColumns(1);
+  sheet.autoResizeColumns(1, maxCols);
+  sheet.getRange(out.length + 2, 1).setValue("Built " + Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm") + " - CS Visibility v2.5.64 - pooled from the Throughput tab. Total = period contacts / period available hours (volume-weighted).");
+  sheet.getRange(out.length + 3, 1).setValue("Excludes PTO and 'assumed off (no activity)' days (a working day with no meeting and <= " + THROUGHPUT_CONFIG.assumeOffFloor + " contacts), so a full day out does not drag an agent's rate. Re-run buildThroughput() then this after the manager trues up calendars.");
+  Logger.log("Throughput Rollup built: matrix " + allAgents.length + "x" + allMonths.length + ", " + Object.keys(month).length + " agent-months, " + Object.keys(week).length + " agent-weeks.");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// EMAIL WORK (per-agent public replies sent)  (added v2.5.51)
+// Counts the public agent-authored email comments each agent sent per Pacific day, the "work
+// done" measure for the balanced scorecard (volume of replies, not just solved tickets). Uses
+// Zendesk's incremental ticket_events stream so it scales to a 6-month backfill later.
+// Run backtestEmailWork() first to validate the counts for the previous week.
+// ════════════════════════════════════════════════════════════════════════════
+function zdAgentUserIds_() {
+  const props = PropertiesService.getScriptProperties();
+  const opts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(props.getProperty("ZENDESK_TOKEN")), "Content-Type": "application/json" }, muteHttpExceptions: true };
+  const subdomain = CONFIG.zendesk.subdomain;
+  const byId = {};   // zendesk user id -> agent name
+  Object.keys(THROUGHPUT_CONFIG.agents).forEach(name => {
+    const email = THROUGHPUT_CONFIG.agents[name].email;
+    try {
+      const resp = UrlFetchApp.fetch("https://" + subdomain + ".zendesk.com/api/v2/users/search.json?query=" + encodeURIComponent(email), opts);
+      if (resp.getResponseCode() === 200) {
+        const users = JSON.parse(resp.getContentText()).users || [];
+        const u = users.find(x => (x.email || "").toLowerCase() === email.toLowerCase()) || users[0];
+        if (u) { byId[u.id] = name; Logger.log("Email work: " + name + " -> Zendesk user " + u.id); }
+        else Logger.log("Email work: no Zendesk user found for " + email);
+      } else Logger.log("Email work: user lookup " + resp.getResponseCode() + " for " + email);
+    } catch (e) { Logger.log("Email work: user lookup failed for " + email + ": " + e); }
+  });
+  return byId;
+}
+
+// Returns { "AgentName|yyyy-MM-dd": count } of public agent email replies in [startStr, endStr].
+function pullEmailWork(startStr, endStr, agentByIdOpt) {
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+  const subdomain = CONFIG.zendesk.subdomain;
+  const opts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(props.getProperty("ZENDESK_TOKEN")), "Content-Type": "application/json" }, muteHttpExceptions: true };
+  const agentById = agentByIdOpt || zdAgentUserIds_();
+  const startUnix = Math.floor(new Date(startStr + "T00:00:00Z").getTime() / 1000) - 8 * 3600;  // back up to be safe; we filter by Pacific day
+  const endMs = new Date(endStr + "T23:59:59").getTime();
+
+  const counts = {};
+  let url = "https://" + subdomain + ".zendesk.com/api/v2/incremental/ticket_events.json?start_time=" + startUnix;
+  let page = 0, replies = 0;
+  const t0 = Date.now();
+  while (url && page < 300 && (Date.now() - t0) < 4.5 * 60 * 1000) {
+    Utilities.sleep(7000);  // throttle: Zendesk incremental exports are capped at 10 requests/min
+    const resp = UrlFetchApp.fetch(url, opts);
+    const code = resp.getResponseCode();
+    if (code === 429) {
+      const h = resp.getHeaders();
+      const ra = parseInt(h["Retry-After"] || h["retry-after"] || "30", 10);
+      Logger.log("ticket_events 429 - waiting " + (ra > 0 ? ra : 30) + "s before retry");
+      Utilities.sleep((ra > 0 ? ra : 30) * 1000);
+      continue;
+    }
+    if (code !== 200) { Logger.log("ticket_events " + code + ": " + resp.getContentText().substring(0, 150)); break; }
+    const data = JSON.parse(resp.getContentText());
+    const events = data.ticket_events || [];
+    let pastRange = false;
+    for (const ev of events) {
+      const ts = ev.created_at ? new Date(ev.created_at).getTime() : (ev.timestamp ? ev.timestamp * 1000 : 0);
+      if (ts > endMs) { pastRange = true; break; }
+      const day = Utilities.formatDate(new Date(ts), tz, "yyyy-MM-dd");
+      if (day < startStr || day > endStr) continue;
+      (ev.child_events || []).forEach(ch => {
+        const type = ch.event_type || ch.type;
+        const isPublic = ch.comment_public === true || ch.comment_public === "true";
+        if (type === "Comment" && isPublic) {
+          const name = agentById[ev.updater_id];
+          if (name) { counts[name + "|" + day] = (counts[name + "|" + day] || 0) + 1; replies++; }
+        }
+      });
+    }
+    if (pastRange) break;
+    url = (data.end_of_stream || !data.next_page) ? null : data.next_page;
+    page++;
+  }
+  Logger.log("pullEmailWork " + startStr + ".." + endStr + ": " + page + " pages, " + replies + " agent replies.");
+  return counts;
+}
+
+// Backtest on the PREVIOUS week (Mon-Fri). Writes an "Email Work Backtest" tab for you to sanity-check
+// before committing to the 6-month backfill.
+function backtestEmailWork() {
+  const tz = CONFIG.businessHours.timezone;
+  const now = new Date();
+  const dow = new Date(Utilities.formatDate(now, tz, "yyyy-MM-dd") + "T12:00:00").getDay();   // 0=Sun..6=Sat
+  const thisMonday = new Date(now.getTime() - ((dow + 6) % 7) * 86400000);
+  const lastMonday = new Date(thisMonday.getTime() - 7 * 86400000);
+  const days = [];
+  for (let i = 0; i < 5; i++) days.push(Utilities.formatDate(new Date(lastMonday.getTime() + i * 86400000), tz, "yyyy-MM-dd"));
+  const startStr = days[0], endStr = days[4];
+
+  const counts = pullEmailWork(startStr, endStr);
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Email Work Backtest");
+  if (!sheet) sheet = ss.insertSheet("Email Work Backtest");
+  sheet.clear();
+  const out = [["Agent"].concat(days).concat(["Total"])];
+  Object.keys(THROUGHPUT_CONFIG.agents).forEach(a => {
+    let tot = 0;
+    const row = [a].concat(days.map(d => { const v = counts[a + "|" + d] || 0; tot += v; return v; }));
+    row.push(tot);
+    out.push(row);
+  });
+  sheet.getRange(1, 1, out.length, days.length + 2).setValues(out);
+  sheet.getRange(1, 1, 1, days.length + 2).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.setFrozenColumns(1);
+  sheet.autoResizeColumns(1, days.length + 2);
+  sheet.getRange(out.length + 2, 1).setValue("Backtest " + startStr + " to " + endStr + " - public agent email replies sent per agent per day (Zendesk ticket events). v2.5.64. Confirm these look right before the 6-month backfill.");
+  Logger.log("Email Work Backtest written for " + startStr + " to " + endStr);
+}
+
+// Diagnostic: figures out why pullEmailWork returns 0 by reporting where comments drop out and
+// dumping a real comment child so we can see the actual field names. Run, then send me the log.
+function debugEmailWork() {
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+  const subdomain = CONFIG.zendesk.subdomain;
+  const opts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(props.getProperty("ZENDESK_TOKEN")), "Content-Type": "application/json" }, muteHttpExceptions: true };
+  const agentById = zdAgentUserIds_();
+  const startUnix = Math.floor(Date.now() / 1000) - 9 * 86400;   // ~last 9 days
+  let url = "https://" + subdomain + ".zendesk.com/api/v2/incremental/ticket_events.json?start_time=" + startUnix;
+  let page = 0, scanned = 0, withChildren = 0, allComments = 0, pubComments = 0, agentPubComments = 0;
+  const childTypes = {};
+  let sampleComment = null, sampleParentKeys = null;
+  while (url && page < 6) {
+    const resp = UrlFetchApp.fetch(url, opts);
+    if (resp.getResponseCode() !== 200) { Logger.log("ticket_events " + resp.getResponseCode() + ": " + resp.getContentText().substring(0, 200)); break; }
+    const data = JSON.parse(resp.getContentText());
+    const events = data.ticket_events || [];
+    if (!sampleParentKeys && events.length) sampleParentKeys = Object.keys(events[0]);
+    events.forEach(ev => {
+      scanned++;
+      const ch = ev.child_events || [];
+      if (ch.length) withChildren++;
+      ch.forEach(c => {
+        const t = c.event_type || c.type || "(none)";
+        childTypes[t] = (childTypes[t] || 0) + 1;
+        if (t === "Comment") {
+          allComments++;
+          if (c.public === true || c.public === "true") pubComments++;
+          if ((c.public === true || c.public === "true") && agentById[c.author_id || ev.updater_id]) agentPubComments++;
+          if (!sampleComment) sampleComment = { parent_updater_id: ev.updater_id, child: c };
+        }
+      });
+    });
+    url = (data.end_of_stream || !data.next_page) ? null : data.next_page;
+    page++; Utilities.sleep(400);
+  }
+  Logger.log("DEBUG scanned=" + scanned + " withChildren=" + withChildren + " allComments=" + allComments + " pubComments=" + pubComments + " agentPubComments=" + agentPubComments + " pages=" + page);
+  Logger.log("DEBUG child types seen: " + JSON.stringify(childTypes));
+  Logger.log("DEBUG agent user ids: " + JSON.stringify(Object.keys(agentById)));
+  Logger.log("DEBUG sample parent event keys: " + JSON.stringify(sampleParentKeys));
+  Logger.log("DEBUG sample comment child: " + (sampleComment ? JSON.stringify(sampleComment).substring(0, 1800) : "none found"));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// EMAIL WORK 6-MONTH BACKFILL  (added v2.5.51)
+// Resumable, month by month. Reuses pullEmailWork, adds "Emails: <First>" columns to the
+// Daily Metrics Log (appended at the end, non-breaking) and writes per-day reply counts.
+// Run backfillEmailWork() repeatedly until the log says COMPLETE. Idempotent (re-running overwrites).
+// ════════════════════════════════════════════════════════════════════════════
+function backfillEmailWork() {
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+  const agentById = zdAgentUserIds_();
+  if (!Object.keys(agentById).length) { Logger.log("Email backfill: no agent IDs resolved, aborting."); return; }
+  const RANGE_START = props.getProperty("EMAIL_WORK_START") || "2025-12-01";
+  const today = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd");
+  let cursor = props.getProperty("EMAIL_WORK_CURSOR") || RANGE_START;   // first-of-month yyyy-MM-dd
+  const t0 = Date.now();
+  let chunks = 0, totalReplies = 0;
+  while (cursor <= today && (Date.now() - t0) < 25 * 60 * 1000) {
+    const y = parseInt(cursor.substring(0, 4)), mo = parseInt(cursor.substring(5, 7));
+    const chunkStart = cursor;
+    const lastDay = new Date(y, mo, 0).getDate();
+    let chunkEnd = y + "-" + ("0" + mo).slice(-2) + "-" + ("0" + lastDay).slice(-2);
+    if (chunkEnd > today) chunkEnd = today;
+    const counts = pullEmailWork(chunkStart, chunkEnd, agentById);
+    const wrote = writeEmailWorkToLog_(counts);
+    Object.keys(counts).forEach(k => totalReplies += counts[k]);
+    chunks++;
+    const nm = mo === 12 ? 1 : mo + 1, ny = mo === 12 ? y + 1 : y;
+    cursor = ny + "-" + ("0" + nm).slice(-2) + "-01";
+    props.setProperty("EMAIL_WORK_CURSOR", cursor);
+    Logger.log("Email backfill: " + chunkStart + ".." + chunkEnd + " -> " + wrote + " cells. Next " + cursor);
+  }
+  if (cursor > today) {
+    props.deleteProperty("EMAIL_WORK_CURSOR");
+    Logger.log("Email backfill COMPLETE through " + today + ". " + chunks + " chunk(s) this run, " + totalReplies + " replies written.");
+  } else {
+    Logger.log("Email backfill PAUSED at " + cursor + " (time guard). " + chunks + " chunk(s) this run. Run backfillEmailWork() again to continue.");
+  }
+}
+
+// Writes { "AgentFullName|yyyy-MM-dd": n } into the Daily Metrics Log "Emails: <First>" columns.
+// Matches agents by first name (the log's per-agent column convention). Returns cells written.
+function writeEmailWorkToLog_(counts) {
+  if (!counts || !Object.keys(counts).length) return 0;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Daily Metrics Log");
+  if (!sheet) { Logger.log("writeEmailWorkToLog_: no Daily Metrics Log."); return 0; }
+  const tz = CONFIG.businessHours.timezone;
+  const lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  let headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+
+  const colFor = {};   // first name -> 1-based column
+  let appended = false;
+  CONFIG.agents.forEach(full => {
+    const f = full.split(" ")[0];
+    const h = "Emails: " + f;
+    let idx = headers.indexOf(h);
+    if (idx === -1) { headers.push(h); idx = headers.length - 1; appended = true; }
+    colFor[f] = idx + 1;
+  });
+  if (appended) sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight("bold").setBackground("#E1DFDD").setFontSize(9);
+
+  const dateIdx = headers.indexOf("Date");
+  const norm = d => {
+    if (!d) return null;
+    if (d instanceof Date) return Utilities.formatDate(d, tz, "yyyy-MM-dd");
+    const s = String(d).trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const p = new Date(s); return isNaN(p.getTime()) ? null : Utilities.formatDate(p, tz, "yyyy-MM-dd");
+  };
+  const rowFor = {};
+  if (lastRow > 1) {
+    const dcol = sheet.getRange(2, dateIdx + 1, lastRow - 1, 1).getValues();
+    dcol.forEach((r, i) => { const k = norm(r[0]); if (k) rowFor[k] = i + 2; });
+  }
+
+  let wrote = 0;
+  Object.keys(counts).forEach(key => {
+    const sep = key.lastIndexOf("|");
+    const first = key.substring(0, sep).split(" ")[0], day = key.substring(sep + 1);
+    const row = rowFor[day], col = colFor[first];
+    if (row && col) { sheet.getRange(row, col).setValue(counts[key]); wrote++; }
+  });
+  return wrote;
+}
+
+// ── One-shot validation of the QBR "Ticket Volume" slide vs the Daily Metrics Log (v2.5.51) ──
+// Run it, then read the execution log. Compares log sums to the slide's stated numbers.
+function validateSlide3Volume() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Daily Metrics Log");
+  if (!sheet) { Logger.log("No Daily Metrics Log."); return; }
+  const tz = CONFIG.businessHours.timezone;
+  const data = sheet.getRange(1, 1, sheet.getLastRow(), sheet.getLastColumn()).getValues();
+  const H = data[0];
+  const iDate = H.indexOf("Date"), iCreated = H.indexOf("Tickets Created"), iSolved = H.indexOf("Solved Total"),
+        iIn = H.indexOf("Inbound Calls"), iOut = H.indexOf("Outbound Calls"), iFwd = H.indexOf("Forwarded to SAS");
+  const norm = d => { if (!d) return null; if (d instanceof Date) return Utilities.formatDate(d, tz, "yyyy-MM-dd"); const s = String(d).trim(); if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s; const p = new Date(s); return isNaN(p.getTime()) ? null : Utilities.formatDate(p, tz, "yyyy-MM-dd"); };
+  const num = v => (typeof v === "number" ? v : (v === "" || v == null ? 0 : Number(v) || 0));
+  const months = ["2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05"];
+  const z = () => ({ created: 0, solved: 0, inb: 0, out: 0, fwd: 0 });
+  const by = {}; months.forEach(m => by[m] = z()); const tot = z();
+  for (let i = 1; i < data.length; i++) {
+    const k = norm(data[i][iDate]); if (!k) continue;
+    const ym = k.substring(0, 7); if (!by[ym]) continue;
+    const r = by[ym];
+    const c = num(data[i][iCreated]), s = num(data[i][iSolved]), inb = num(data[i][iIn]), out = num(data[i][iOut]), fwd = iFwd >= 0 ? num(data[i][iFwd]) : 0;
+    r.created += c; r.solved += s; r.inb += inb; r.out += out; r.fwd += fwd;
+    tot.created += c; tot.solved += s; tot.inb += inb; tot.out += out; tot.fwd += fwd;
+  }
+  Logger.log("Month      Created  Solved  InAns  Outbnd  Calls(in+out)  Total(created+calls)");
+  months.forEach(m => { const r = by[m]; const calls = r.inb + r.out; Logger.log(m + "    " + r.created + "      " + r.solved + "     " + r.inb + "    " + r.out + "      " + calls + "         " + (r.created + calls)); });
+  const calls = tot.inb + tot.out;
+  Logger.log("----------");
+  Logger.log("6-MO Created (written tickets): " + tot.created + "   [slide says 6,774]");
+  Logger.log("6-MO Solved Total: " + tot.solved);
+  Logger.log("6-MO Inbound Answered: " + tot.inb + "   Outbound: " + tot.out + "   Forwarded-to-SAS: " + tot.fwd);
+  Logger.log("6-MO Calls (in-answered + out): " + calls + "   [slide says 4,441]");
+  Logger.log("6-MO Total (created + calls): " + (tot.created + calls) + "   [slide says 11,215]");
+  Logger.log("Monthly avg: " + Math.round((tot.created + calls) / 6) + "   [slide says 1,869]");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SUPPORT VOLUME BY ORIGIN CHANNEL  (added v2.5.51)
+// "People who came to support for help" = inbound requests, each counted once. Pulls Zendesk
+// tickets created Dec 2025-May 2026 grouped by via.channel (phone/email/chat/web/SMS/...), per
+// month, into a "Volume by Channel" sheet. Outbound is excluded (not demand). Resumable.
+// Run repeatedly until it logs the channel totals; the grand total should tie to ~6,774.
+// ════════════════════════════════════════════════════════════════════════════
+function pullTicketsByChannelQBR() {
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+  const subdomain = CONFIG.zendesk.subdomain;
+  const opts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(props.getProperty("ZENDESK_TOKEN")), "Content-Type": "application/json" }, muteHttpExceptions: true };
+  const RANGE_START = "2025-12-01", RANGE_END = "2026-05-31";
+  const startUnix = Math.floor(new Date(RANGE_START + "T00:00:00Z").getTime() / 1000) - 8 * 3600;
+  let cursor = Number(props.getProperty("TBC_CURSOR") || startUnix);
+  let acc = {};
+  try { acc = JSON.parse(props.getProperty("TBC_ACC") || "{}"); } catch (e) { acc = {}; }
+
+  let url = "https://" + subdomain + ".zendesk.com/api/v2/incremental/tickets.json?start_time=" + cursor;
+  let page = 0, seen = 0, inWin = 0, done = false;
+  const t0 = Date.now();
+  while (url && (Date.now() - t0) < 4.5 * 60 * 1000) {
+    const resp = UrlFetchApp.fetch(url, opts);
+    const code = resp.getResponseCode();
+    if (code === 429) { Utilities.sleep(10000); continue; }
+    if (code !== 200) { Logger.log("incr tickets " + code + ": " + resp.getContentText().substring(0, 150)); break; }
+    const data = JSON.parse(resp.getContentText());
+    (data.tickets || []).forEach(t => {
+      seen++;
+      const cms = t.created_at ? new Date(t.created_at).getTime() : 0;
+      if (!cms) return;
+      const day = Utilities.formatDate(new Date(cms), tz, "yyyy-MM-dd");
+      if (day < RANGE_START || day > RANGE_END) return;
+      inWin++;
+      const ch = (t.via && t.via.channel) ? String(t.via.channel) : "(none)";
+      const ym = day.substring(0, 7);
+      acc[ym + "|" + ch] = (acc[ym + "|" + ch] || 0) + 1;
+    });
+    if (data.end_time) cursor = data.end_time;
+    if (data.end_of_stream || !data.next_page) { done = true; break; }
+    url = data.next_page;
+    Utilities.sleep(500);
+    page++;
+  }
+  props.setProperty("TBC_CURSOR", String(cursor));
+  props.setProperty("TBC_ACC", JSON.stringify(acc));
+  Logger.log("Tickets-by-channel: page batch " + page + ", seen " + seen + ", in-window " + inWin + ", done=" + done);
+  if (!done) { Logger.log("Not caught up - run pullTicketsByChannelQBR() again to continue."); return; }
+
+  const months = ["2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05"];
+  const channels = {};
+  Object.keys(acc).forEach(k => { const ch = k.split("|")[1]; channels[ch] = (channels[ch] || 0) + acc[k]; });
+  const chanList = Object.keys(channels).sort((a, b) => channels[b] - channels[a]);
+  let grand = 0; chanList.forEach(c => grand += channels[c]);
+  Logger.log("Channel totals (Dec-May): " + JSON.stringify(channels));
+  Logger.log("GRAND TOTAL tickets created (all channels): " + grand + "   [Tickets Created in log = 6,774]");
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Volume by Channel");
+  if (!sheet) sheet = ss.insertSheet("Volume by Channel");
+  sheet.clear();
+  const header = ["Channel"].concat(months.map(qbrMonthLabel)).concat(["6-Mo Total"]);
+  const out = [header];
+  chanList.forEach(ch => { let tot = 0; const row = [ch].concat(months.map(m => { const v = acc[m + "|" + ch] || 0; tot += v; return v; })); row.push(tot); out.push(row); });
+  const totRow = ["TOTAL"].concat(months.map(m => { let s = 0; chanList.forEach(ch => s += acc[m + "|" + ch] || 0); return s; })); totRow.push(grand); out.push(totRow);
+  sheet.getRange(1, 1, out.length, header.length).setValues(out);
+  sheet.getRange(1, 1, 1, header.length).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.getRange(out.length, 1, 1, header.length).setFontWeight("bold").setBackground("#E1DFDD");
+  sheet.setFrozenColumns(1); sheet.autoResizeColumns(1, header.length);
+  sheet.getRange(out.length + 2, 1).setValue("Tickets created by origin channel (Zendesk via.channel), Dec 2025-May 2026. Each request counted once; outbound excluded (not inbound demand). v2.5.64.");
+  props.deleteProperty("TBC_CURSOR"); props.deleteProperty("TBC_ACC");
+  Logger.log("Volume by Channel sheet written. Channels: " + chanList.join(", "));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SUPPORT DEMAND BY CHANNEL (filtered)  (v2.5.51)
+// "People who came to support for help," each counted ONCE. Excludes outbound, bot (AI Agent),
+// test, auto-close. PHONE is counted once from Aircall (answered + SAS); all phone-origin Zendesk
+// tickets are dropped (voice channel, missed_call tags, aircall tag) to avoid double-counting.
+// api is split by tag: gleap -> In-app (Gleap); sh_employee + maestra -> Other integrations;
+// missed_call / Safe Haven forms / macros -> dropped (not customer demand). Resumable; logs drops.
+// ════════════════════════════════════════════════════════════════════════════
+function pullDemandByChannelQBR() {
+  const props = PropertiesService.getScriptProperties();
+  const tz = CONFIG.businessHours.timezone;
+  const subdomain = CONFIG.zendesk.subdomain;
+  const opts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(props.getProperty("ZENDESK_TOKEN")), "Content-Type": "application/json" }, muteHttpExceptions: true };
+  const RANGE_START = "2025-12-01", RANGE_END = "2026-05-31";
+  const EXCLUDE_TAGS = ["aircall", "internal__testing", "auto_close"];
+
+  let aiAgentId = null;
+  try {
+    const r = UrlFetchApp.fetch("https://" + subdomain + ".zendesk.com/api/v2/users/search.json?query=" + encodeURIComponent("AI Agent"), opts);
+    if (r.getResponseCode() === 200) { const us = JSON.parse(r.getContentText()).users || []; const u = us.find(x => /ai agent/i.test(x.name || "")); if (u) aiAgentId = u.id; }
+  } catch (e) {}
+  Logger.log("AI Agent user id: " + aiAgentId);
+
+  const startUnix = Math.floor(new Date(RANGE_START + "T00:00:00Z").getTime() / 1000) - 8 * 3600;
+  let cursor = Number(props.getProperty("DBC_CURSOR") || startUnix);
+  let acc = {}, dropCounts = {};
+  try { acc = JSON.parse(props.getProperty("DBC_ACC") || "{}"); } catch (e) {}
+  try { dropCounts = JSON.parse(props.getProperty("DBC_DROPS") || "{}"); } catch (e) {}
+  const drop = (k) => { dropCounts[k] = (dropCounts[k] || 0) + 1; };
+  const hasTag = (tags, t) => tags.indexOf(t) >= 0;
+
+  // returns a channel label, or null to drop (phone-origin or non-demand)
+  function classify(ch, tags) {
+    if (ch === "voice") { drop("voice channel (phone, counted via Aircall)"); return null; }
+    if (ch === "api") {
+      if (tags.some(tg => tg.indexOf("missed_call") === 0)) { drop("api missed_call (phone double-count)"); return null; }
+      if (hasTag(tags, "gleap") || hasTag(tags, "incoming_gleap")) return "In-app (Gleap)";
+      if (hasTag(tags, "sh_employee") || hasTag(tags, "maestra")) return "Other integrations";
+      drop("api other (Safe Haven forms / macros / misc - not demand)"); return null;
+    }
+    if (ch === "email") return "Email";
+    if (ch === "web") return "Web";
+    if (ch === "native_messaging") return "Chat";
+    if (ch && (ch.indexOf("sunshine") === 0 || ch.indexOf("twitter") >= 0 || ch.indexOf("facebook") >= 0)) return "Social";
+    return ch;
+  }
+
+  let url = "https://" + subdomain + ".zendesk.com/api/v2/incremental/tickets.json?start_time=" + cursor;
+  let page = 0, seen = 0, kept = 0, excluded = 0, done = false;
+  const t0 = Date.now();
+  while (url && (Date.now() - t0) < 4.5 * 60 * 1000) {
+    const resp = UrlFetchApp.fetch(url, opts); const code = resp.getResponseCode();
+    if (code === 429) { Utilities.sleep(10000); continue; }
+    if (code !== 200) { Logger.log("incr tickets " + code + ": " + resp.getContentText().substring(0, 150)); break; }
+    const data = JSON.parse(resp.getContentText());
+    (data.tickets || []).forEach(t => {
+      seen++;
+      const cms = t.created_at ? new Date(t.created_at).getTime() : 0; if (!cms) return;
+      const day = Utilities.formatDate(new Date(cms), tz, "yyyy-MM-dd");
+      if (day < RANGE_START || day > RANGE_END) return;
+      const tags = t.tags || [];
+      if (tags.some(tg => EXCLUDE_TAGS.indexOf(tg) >= 0)) { excluded++; return; }
+      if (aiAgentId && t.assignee_id === aiAgentId) { excluded++; return; }
+      const ch = (t.via && t.via.channel) ? String(t.via.channel) : "(none)";
+      const label = classify(ch, tags);
+      if (!label) { excluded++; return; }
+      const ym = day.substring(0, 7);
+      acc[ym + "|" + label] = (acc[ym + "|" + label] || 0) + 1; kept++;
+    });
+    if (data.end_time) cursor = data.end_time;
+    if (data.end_of_stream || !data.next_page) { done = true; break; }
+    url = data.next_page; Utilities.sleep(500); page++;
+  }
+  props.setProperty("DBC_CURSOR", String(cursor));
+  props.setProperty("DBC_ACC", JSON.stringify(acc));
+  props.setProperty("DBC_DROPS", JSON.stringify(dropCounts));
+  Logger.log("Demand-by-channel: page batch " + page + ", seen " + seen + ", kept " + kept + ", excluded " + excluded + ", done=" + done);
+  if (!done) { Logger.log("Not caught up - run pullDemandByChannelQBR() again to continue."); return; }
+
+  const months = ["2025-12", "2026-01", "2026-02", "2026-03", "2026-04", "2026-05"];
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const log = ss.getSheetByName("Daily Metrics Log");
+  const phoneByMonth = {}; months.forEach(m => phoneByMonth[m] = 0);
+  if (log) {
+    const d = log.getRange(1, 1, log.getLastRow(), log.getLastColumn()).getValues(); const H = d[0];
+    const iD = H.indexOf("Date"), iIn = H.indexOf("Inbound Calls"), iF = H.indexOf("Forwarded to SAS");
+    for (let i = 1; i < d.length; i++) {
+      let k = d[i][iD]; k = (k instanceof Date) ? Utilities.formatDate(k, tz, "yyyy-MM-dd") : String(k).substring(0, 10);
+      const ym = k.substring(0, 7); if (phoneByMonth[ym] === undefined) continue;
+      phoneByMonth[ym] += (Number(d[i][iIn]) || 0) + (iF >= 0 ? (Number(d[i][iF]) || 0) : 0);
+    }
+  }
+
+  const channels = {}; Object.keys(acc).forEach(k => { const ch = k.split("|")[1]; channels[ch] = (channels[ch] || 0) + acc[k]; });
+  const chanList = Object.keys(channels).sort((a, b) => channels[b] - channels[a]);
+  let grand = 0; chanList.forEach(c => grand += channels[c]);
+  let phoneGrand = 0; months.forEach(m => phoneGrand += phoneByMonth[m]);
+  Logger.log("Written/in-app channels: " + JSON.stringify(channels));
+  Logger.log("Dropped (not demand / double-count): " + JSON.stringify(dropCounts));
+  Logger.log("Written/in-app demand total: " + grand);
+  Logger.log("Phone inbound (Aircall answered + SAS): " + phoneGrand);
+  Logger.log("TOTAL DEMAND: " + (grand + phoneGrand));
+
+  let sheet = ss.getSheetByName("Support Demand by Channel"); if (!sheet) sheet = ss.insertSheet("Support Demand by Channel"); sheet.clear();
+  const header = ["Channel"].concat(months.map(qbrMonthLabel)).concat(["6-Mo Total"]);
+  const out = [header];
+  chanList.forEach(ch => { let tot = 0; const row = [ch].concat(months.map(m => { const v = acc[m + "|" + ch] || 0; tot += v; return v; })); row.push(tot); out.push(row); });
+  let pTot = 0; const pRow = ["Phone (inbound: answered+SAS)"].concat(months.map(m => { pTot += phoneByMonth[m]; return phoneByMonth[m]; })); pRow.push(pTot); out.push(pRow);
+  const totRow = ["TOTAL DEMAND"].concat(months.map(m => { let s = phoneByMonth[m]; chanList.forEach(ch => s += acc[m + "|" + ch] || 0); return s; })); totRow.push(grand + phoneGrand); out.push(totRow);
+  out.push(new Array(header.length).fill(""));
+  out.push(["SYNC vs ASYNC (slide view)"].concat(new Array(header.length - 1).fill("")));
+  const asyncRow = ["Async (email / written)"].concat(months.map(m => { let s = 0; chanList.forEach(ch => s += acc[m + "|" + ch] || 0); return s; })); asyncRow.push(grand); out.push(asyncRow);
+  const syncRow = ["Sync (phone)"].concat(months.map(m => phoneByMonth[m])); syncRow.push(phoneGrand); out.push(syncRow);
+  sheet.getRange(1, 1, out.length, header.length).setValues(out);
+  sheet.getRange(1, 1, 1, header.length).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.getRange(out.length, 1, 1, header.length).setFontWeight("bold").setBackground("#E1DFDD");
+  sheet.setFrozenColumns(1); sheet.autoResizeColumns(1, header.length);
+  sheet.getRange(out.length + 2, 1).setValue("WHAT THIS SHOWS: How many customers reached out to support each month, counted once per contact. The numbers come from Zendesk (written tickets) and Aircall (phone calls). \"Async\" means written contacts where the customer is not waiting on the line - emails, web-form submissions, and in-app messages (Gleap). \"Sync\" means live phone support - inbound calls we answered plus calls routed to our after-hours partner (SAS). We leave out our own outbound calls, automated bot replies, internal test tickets, and duplicate phone tickets, so nothing is counted twice. Together these two buckets are the most complete picture of how many customers sought help from support over time.");
+  sheet.getRange(out.length + 3, 1).setValue("Method (audit): async = Zendesk tickets created via email / web form / Gleap / chat; sync = Aircall inbound answered + forwarded to SAS. Excludes all outbound, the AI Agent bot, tags aircall/internal__testing/auto_close, and phone-origin Zendesk tickets (voice channel, missed_call, Safe Haven forms, macros). Counts every customer contact - NOT filtered by which agent handled it. v2.5.64.");
+  sheet.getRange(out.length + 2, 1, 2, 1).setWrap(true);
+  props.deleteProperty("DBC_CURSOR"); props.deleteProperty("DBC_ACC"); props.deleteProperty("DBC_DROPS");
+  Logger.log("Support Demand by Channel sheet written.");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AGENT SCORECARD (v2.5.51) - balanced work / efficiency / quality, normalized by available hrs.
+// Reuses calendar-based availability from the "Throughput" tab; joins per-agent Emails + CSAT from
+// the Daily Metrics Log. Run buildThroughput() first, then this.
+//   Work = answered inbound + outbound + emails sent ; Work/hr = Work / available hours
+//   Solves/hr = solved tickets / available hours
+//   Touches/solve = Work / solves (actions per resolution; lower is leaner)
+//   Email CSAT % / Phone CSAT % = satisfied / responses, per channel (shown separately - see note)
+// Rates pooled (sum / sum); PTO / 'assumed off' days (Avail hrs <= 0) excluded.
+// ════════════════════════════════════════════════════════════════════════════
+function buildAgentScorecard() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = CONFIG.businessHours.timezone;
+  const thr = ss.getSheetByName("Throughput");
+  if (!thr || thr.getLastRow() < 2) { Logger.log("Agent Scorecard: run buildThroughput() first (no Throughput tab)."); return; }
+
+  const emailByDayFirst = {};
+  const csat = {};
+  CONFIG.agents.forEach(a => { csat[a.split(" ")[0]] = { eSat: 0, eTot: 0, pSat: 0, pTot: 0 }; });
+  const log = ss.getSheetByName("Daily Metrics Log");
+  if (log) {
+    const d = log.getRange(1, 1, log.getLastRow(), log.getLastColumn()).getValues();
+    const H = d[0];
+    const iDate = H.indexOf("Date");
+    const num = v => { const n = Number(v); return isNaN(n) ? 0 : n; };
+    const eCol = {}, cc = {};
+    CONFIG.agents.forEach(a => {
+      const f = a.split(" ")[0];
+      eCol[f] = H.indexOf("Emails: " + f);
+      cc[f] = { es: H.indexOf("Email CSAT Sat: " + f), et: H.indexOf("Email CSAT Tot: " + f), ps: H.indexOf("Phone CSAT Sat: " + f), pt: H.indexOf("Phone CSAT Tot: " + f) };
+    });
+    for (let i = 1; i < d.length; i++) {
+      let k = d[i][iDate]; k = (k instanceof Date) ? Utilities.formatDate(k, tz, "yyyy-MM-dd") : String(k).substring(0, 10);
+      CONFIG.agents.forEach(a => {
+        const f = a.split(" ")[0];
+        if (eCol[f] >= 0) { const v = num(d[i][eCol[f]]); if (v) emailByDayFirst[k + "|" + f] = v; }
+        const c = cc[f];
+        const et = c.et >= 0 ? num(d[i][c.et]) : 0, pt = c.pt >= 0 ? num(d[i][c.pt]) : 0;
+        if (et > 0) { csat[f].eSat += (c.es >= 0 ? num(d[i][c.es]) : 0); csat[f].eTot += et; }
+        if (pt > 0) { csat[f].pSat += (c.ps >= 0 ? num(d[i][c.ps]) : 0); csat[f].pTot += pt; }
+      });
+    }
+  }
+
+  const td = thr.getRange(1, 1, thr.getLastRow(), thr.getLastColumn()).getValues();
+  const TH = td[0];
+  const ci = { date: TH.indexOf("Date"), agent: TH.indexOf("Agent"), avail: TH.indexOf("Avail hrs"), calls: TH.indexOf("Calls"), tickets: TH.indexOf("Tickets") };
+  const agg = {}, byMonth = {};
+  const ensure = (o, k) => (o[k] = o[k] || { avail: 0, calls: 0, emails: 0, solves: 0, work: 0 });
+  for (let i = 1; i < td.length; i++) {
+    const row = td[i];
+    const dateStr = (row[ci.date] instanceof Date) ? Utilities.formatDate(row[ci.date], tz, "yyyy-MM-dd") : String(row[ci.date]).substring(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) continue;
+    const agent = row[ci.agent]; if (!agent) continue;
+    const avail = Number(row[ci.avail]) || 0;
+    if (avail <= 0) continue;
+    const first = String(agent).split(" ")[0];
+    const calls = Number(row[ci.calls]) || 0;
+    const solves = Number(row[ci.tickets]) || 0;
+    const emails = emailByDayFirst[dateStr + "|" + first] || 0;
+    const a = ensure(agg, agent);
+    a.avail += avail; a.calls += calls; a.emails += emails; a.solves += solves;
+    const ym = dateStr.substring(0, 7);
+    const m = ensure(byMonth, agent + "|" + ym);
+    m.avail += avail; m.work += (calls + emails); m.solves += solves;
+  }
+
+  const agents = Object.keys(agg).sort();
+  const months = [...new Set(Object.keys(byMonth).map(k => k.split("|")[1]))].sort();
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const r1 = (n) => Math.round(n * 10) / 10;
+
+  const out = [], sectionRows = [];
+  out.push(["AGENT SCORECARD - work, efficiency & quality per available working hour"]);
+  out.push(["Agent", "Work/hr", "Solves/hr", "Touches/solve", "Email CSAT %", "Phone CSAT %", "", "Calls", "Emails", "Work (calls+emails)", "Solves", "Avail hrs", "Email resp", "Phone resp"]);
+  agents.forEach(agent => {
+    const a = agg[agent]; const work = a.calls + a.emails;
+    const cs = csat[agent.split(" ")[0]] || { eSat: 0, eTot: 0, pSat: 0, pTot: 0 };
+    out.push([agent,
+      a.avail > 0 ? r2(work / a.avail) : "",
+      a.avail > 0 ? r2(a.solves / a.avail) : "",
+      a.solves > 0 ? r2(work / a.solves) : "",
+      cs.eTot > 0 ? r1(cs.eSat / cs.eTot * 100) : "",
+      cs.pTot > 0 ? r1(cs.pSat / cs.pTot * 100) : "",
+      "", a.calls, a.emails, work, a.solves, r1(a.avail), cs.eTot, cs.pTot]);
+  });
+  out.push([""]);
+  sectionRows.push(out.length); out.push(["WORK/HR BY MONTH"].concat(months.map(qbrMonthLabel)));
+  agents.forEach(agent => { const row = [agent]; months.forEach(ym => { const m = byMonth[agent + "|" + ym]; row.push(m && m.avail > 0 ? r2(m.work / m.avail) : ""); }); out.push(row); });
+  out.push([""]);
+  sectionRows.push(out.length); out.push(["SOLVES/HR BY MONTH"].concat(months.map(qbrMonthLabel)));
+  agents.forEach(agent => { const row = [agent]; months.forEach(ym => { const m = byMonth[agent + "|" + ym]; row.push(m && m.avail > 0 ? r2(m.solves / m.avail) : ""); }); out.push(row); });
+
+  let sheet = ss.getSheetByName("Agent Scorecard");
+  if (!sheet) sheet = ss.insertSheet("Agent Scorecard");
+  sheet.clear();
+  const width = out.reduce((w, r) => Math.max(w, r.length), 0);
+  out.forEach(r => { while (r.length < width) r.push(""); });
+  sheet.getRange(1, 1, out.length, width).setValues(out);
+  sheet.getRange(1, 1, 1, width).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.getRange(2, 1, 1, width).setFontWeight("bold").setBackground("#E1DFDD");
+  sectionRows.forEach(idx => sheet.getRange(idx + 1, 1, 1, width).setFontWeight("bold").setBackground("#E1DFDD"));
+  sheet.setFrozenColumns(1); sheet.autoResizeColumns(1, width);
+  const stamp = Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm");
+  const fr = out.length + 2;
+  sheet.getRange(fr, 1).setValue("HOW TO READ: Each agent's totals are pooled over the period and divided by the hours they were actually available (scheduled time minus PTO, meetings, lunch and breaks), so vacation or fewer working days do not penalize them. Work/hr = actions per available hour (answered inbound + outbound calls + emails sent). Solves/hr = tickets resolved per available hour. Touches/solve = actions per resolution (lower is leaner). Email CSAT % and Phone CSAT % = share of that agent's surveyed responses that were satisfied, shown separately, with Email resp / Phone resp as the sample sizes.");
+  sheet.getRange(fr + 1, 1).setValue("DATA: Built from the Daily Metrics Log (per-agent calls, solves, emails, CSAT) joined to the Throughput tab (calendar-based available hours). Rates are pooled (sum / sum), not averages of daily values. PTO and 'assumed off' days (Avail hrs <= 0) are excluded from the rates. Built " + stamp + " - CS Visibility v2.5.64. Run buildThroughput() first, then buildAgentScorecard().");
+  sheet.getRange(fr + 2, 1).setValue("CSAT NOTE: Email and phone are split on purpose. Phone surveys are only partially attributed to individual agents (most land in the team total), so per-agent Phone resp is small - read phone CSAT as directional. Email is the better-attributed per-agent signal. This is also why an agent's CSAT here reads lower than the team QBR figure: the team number is phone-weighted (phone scores higher), the per-agent view is email-weighted.");
+  Logger.log("Agent Scorecard built for " + agents.length + " agents across " + months.length + " months.");
+  try { ss.toast("Agent Scorecard built", "Done", 5); } catch (e) {}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// RESOURCES TAB + agent-hub cleanup (v2.5.51)
+// Per-agent "Agent Hub" tabs no longer live in the Command Center (they bloated the spreadsheet
+// and slowed every refresh). Each agent's hub is now its own standalone sheet (AGENT_SHEETS).
+// This deletes the old in-Command-Center agent tabs and builds a "Resources" tab with a button-
+// style link to each agent's discrete hub. Run once after deploying.
+// ════════════════════════════════════════════════════════════════════════════
+function setupAgentResourcesTab() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  let agentSheets = {};
+  try { agentSheets = JSON.parse(props.getProperty("AGENT_SHEETS") || "{}"); } catch (e) {}
+
+  // 1) remove the old in-Command-Center agent-hub tabs
+  CONFIG.agents.forEach(agent => {
+    const name = agent.split(" ")[0] + " - Agent Hub";
+    const sh = ss.getSheetByName(name);
+    if (sh) { try { ss.deleteSheet(sh); Logger.log("Removed Command Center tab: " + name); } catch (e) { Logger.log("Could not delete " + name + ": " + e); } }
+  });
+
+  // 2) build/refresh the Resources tab with a link button per agent
+  let sheet = ss.getSheetByName("Resources");
+  if (!sheet) sheet = ss.insertSheet("Resources");
+  sheet.clear();
+  sheet.setColumnWidth(1, 50);
+  sheet.setColumnWidth(2, 430);
+  sheet.getRange("B2").setValue("RESOURCES").setFontSize(18).setFontWeight("bold").setFontColor("#1B3747");
+  sheet.getRange("B3").setValue("Agent Hubs - click to open each agent's live dashboard (refreshes every 5 min).").setFontColor("#8A8A8A").setFontSize(11);
+  let row = 5;
+  CONFIG.agents.forEach(agent => {
+    const id = agentSheets[agent];
+    const cell = sheet.getRange(row, 2);
+    if (id) {
+      const url = "https://docs.google.com/spreadsheets/d/" + id + "/edit";
+      const label = "   " + agent + "'s Agent Hub   →";
+      cell.setFormula('=HYPERLINK("' + url + '", "' + label + '")');
+      cell.setBackground("#1B3747").setFontColor("#FFFFFF").setFontWeight("bold").setFontSize(13)
+        .setHorizontalAlignment("left").setVerticalAlignment("middle");
+      sheet.setRowHeight(row, 40);
+    } else {
+      cell.setValue(agent + " - no discrete sheet configured in AGENT_SHEETS").setFontColor("#C62828").setFontSize(11);
+    }
+    row += 2;
+  });
+  sheet.getRange(row + 1, 2).setValue("Built " + Utilities.formatDate(new Date(), CONFIG.businessHours.timezone, "yyyy-MM-dd HH:mm") + " - CS Visibility v2.5.64. Agent hubs are standalone sheets; this tab links to them. Re-run setupAgentResourcesTab() if an agent's sheet ID changes.");
+  try { ss.toast("Resources tab built", "Done", 5); } catch (e) {}
+  Logger.log("Resources tab built with links for " + CONFIG.agents.length + " agents.");
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// AGENT TRENDS (v2.5.51) - monthly line charts (a line per agent) on an "Agent Trends" tab.
+// Compares the three agents and lets you trace one agent's trajectory (e.g. a new hire's ramp).
+// Charts: Work/hr, Solves/hr, Touches/solve (rates) + Work volume, Solves volume (raw - the
+// clearest ramp signal). CSAT is not trended (per-agent monthly samples too small to be meaningful).
+// Run buildThroughput() first, then this.
+// ════════════════════════════════════════════════════════════════════════════
+function buildAgentTrends() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = CONFIG.businessHours.timezone;
+  const thr = ss.getSheetByName("Throughput");
+  if (!thr || thr.getLastRow() < 2) { Logger.log("Agent Trends: run buildThroughput() first (no Throughput tab)."); return; }
+
+  // emails per (date, first)
+  const emailByDayFirst = {};
+  const log = ss.getSheetByName("Daily Metrics Log");
+  if (log) {
+    const d = log.getRange(1, 1, log.getLastRow(), log.getLastColumn()).getValues();
+    const H = d[0]; const iDate = H.indexOf("Date");
+    const eCol = {}; CONFIG.agents.forEach(a => { eCol[a.split(" ")[0]] = H.indexOf("Emails: " + a.split(" ")[0]); });
+    for (let i = 1; i < d.length; i++) {
+      let k = d[i][iDate]; k = (k instanceof Date) ? Utilities.formatDate(k, tz, "yyyy-MM-dd") : String(k).substring(0, 10);
+      Object.keys(eCol).forEach(f => { if (eCol[f] >= 0) { const v = Number(d[i][eCol[f]]) || 0; if (v) emailByDayFirst[k + "|" + f] = v; } });
+    }
+  }
+
+  // aggregate per agent per month from the Throughput tab (avail > 0 days only)
+  const td = thr.getRange(1, 1, thr.getLastRow(), thr.getLastColumn()).getValues();
+  const TH = td[0];
+  const ci = { date: TH.indexOf("Date"), agent: TH.indexOf("Agent"), avail: TH.indexOf("Avail hrs"), calls: TH.indexOf("Calls"), tickets: TH.indexOf("Tickets"), note: TH.indexOf("Note") };
+  const byMonth = {}, offByMonth = {};
+  for (let i = 1; i < td.length; i++) {
+    const row = td[i];
+    const dateStr = (row[ci.date] instanceof Date) ? Utilities.formatDate(row[ci.date], tz, "yyyy-MM-dd") : String(row[ci.date]).substring(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) continue;
+    const agent = row[ci.agent]; if (!agent) continue;
+    const avail = Number(row[ci.avail]) || 0;
+    const ym = dateStr.substring(0, 7); const key = agent + "|" + ym;
+    if (avail <= 0) { const o = offByMonth[key] || (offByMonth[key] = { off: 0 }); o.off++; continue; }
+    const first = String(agent).split(" ")[0];
+    const calls = Number(row[ci.calls]) || 0, solves = Number(row[ci.tickets]) || 0;
+    const emails = emailByDayFirst[dateStr + "|" + first] || 0;
+    const m = byMonth[key] || (byMonth[key] = { avail: 0, work: 0, solves: 0 });
+    m.avail += avail; m.work += (calls + emails); m.solves += solves;
+  }
+
+  const agents = [...new Set(td.slice(1).map(r => r[ci.agent]).filter(Boolean))].sort();
+  const months = [...new Set(Object.keys(byMonth).map(k => k.split("|")[1]))].sort();
+  const r2 = n => Math.round(n * 100) / 100;
+  const metrics = [
+    { title: "Work per available hour", fn: m => (m && m.avail > 0) ? r2(m.work / m.avail) : "" },
+    { title: "Solves per available hour", fn: m => (m && m.avail > 0) ? r2(m.solves / m.avail) : "" },
+    { title: "Touches per solve", fn: m => (m && m.solves > 0) ? r2(m.work / m.solves) : "" },
+    { title: "Work volume per month (calls + emails)", fn: m => m ? m.work : "" },
+    { title: "Solves per month", fn: m => m ? m.solves : "" },
+  ];
+
+  let sheet = ss.getSheetByName("Agent Trends");
+  if (!sheet) sheet = ss.insertSheet("Agent Trends");
+  sheet.getCharts().forEach(c => sheet.removeChart(c));
+  sheet.clear();
+  sheet.getRange("A1").setValue("AGENT TRENDS - monthly, one line per agent. Trace a single line for an individual's trajectory (e.g. a new hire's ramp); compare lines to coach.").setFontWeight("bold").setFontColor("#1B3747");
+
+  // Deako brand series colors (from BRAND palette): navy, terracotta, moss, rose, air-blue, beige-dark
+  const DEAKO_SERIES = ["#1B3747", "#BA866A", "#889578", "#B692A1", "#7597A0", "#523823"];
+  const seriesColors = DEAKO_SERIES.slice(0, agents.length);
+  let blockRow = 3, chartRow = 3;
+  metrics.forEach(metric => {
+    const hdr = ["Month"].concat(agents);
+    const rows = months.map(ym => [qbrMonthLabel(ym)].concat(agents.map(a => metric.fn(byMonth[a + "|" + ym]))));
+    sheet.getRange(blockRow, 1).setValue(metric.title).setFontWeight("bold");
+    sheet.getRange(blockRow + 1, 1, 1, hdr.length).setValues([hdr]).setFontWeight("bold").setBackground("#E1DFDD");
+    sheet.getRange(blockRow + 2, 1, rows.length, hdr.length).setValues(rows);
+    const dataRange = sheet.getRange(blockRow + 1, 1, rows.length + 1, hdr.length);
+    const chart = sheet.newChart().asLineChart()
+      .addRange(dataRange).setNumHeaders(1)
+      .setOption("useFirstColumnAsDomain", true)
+      .setOption("title", metric.title)
+      .setOption("legend", { position: "right" })
+      .setOption("pointSize", 4)
+      .setOption("colors", seriesColors)
+      .setOption("backgroundColor", "#FFFFFF")
+      .setOption("titleTextStyle", { color: "#1B3747", fontSize: 13, bold: true })
+      .setOption("legendTextStyle", { color: "#1D1D1D" })
+      .setOption("hAxis", { textStyle: { color: "#1D1D1D" } })
+      .setOption("vAxis", { textStyle: { color: "#1D1D1D" }, gridlines: { color: "#E1DFDD" } })
+      .setOption("width", 470).setOption("height", 300)
+      .setPosition(chartRow, agents.length + 3, 0, 0)
+      .build();
+    sheet.insertChart(chart);
+    blockRow += months.length + 3;
+    chartRow += 17;
+  });
+
+  // Days off per month (avail<=0: PTO + assumed-off) - table + graph to validate the time-off logic
+  (function () {
+    const hdr = ["Month"].concat(agents);
+    const rows = months.map(ym => [qbrMonthLabel(ym)].concat(agents.map(a => { const key = a + "|" + ym; const hw = byMonth[key], o = offByMonth[key]; return (!hw && !o) ? "" : (o ? o.off : 0); })));
+    sheet.getRange(blockRow, 1).setValue("Days off per month").setFontWeight("bold");
+    sheet.getRange(blockRow + 1, 1, 1, hdr.length).setValues([hdr]).setFontWeight("bold").setBackground("#E1DFDD");
+    sheet.getRange(blockRow + 2, 1, rows.length, hdr.length).setValues(rows);
+    const dr = sheet.getRange(blockRow + 1, 1, rows.length + 1, hdr.length);
+    const ch = sheet.newChart().asColumnChart().addRange(dr).setNumHeaders(1).setOption("useFirstColumnAsDomain", true).setOption("title", "Days off per month (PTO + assumed-off)").setOption("legend", { position: "right" }).setOption("colors", seriesColors).setOption("backgroundColor", "#FFFFFF").setOption("titleTextStyle", { color: "#1B3747", fontSize: 13, bold: true }).setOption("legendTextStyle", { color: "#1D1D1D" }).setOption("hAxis", { textStyle: { color: "#1D1D1D" } }).setOption("vAxis", { textStyle: { color: "#1D1D1D" }, gridlines: { color: "#E1DFDD" } }).setOption("width", 470).setOption("height", 300).setPosition(chartRow, agents.length + 3, 0, 0).build();
+    sheet.insertChart(ch);
+    blockRow += months.length + 3; chartRow += 17;
+  })();
+
+  sheet.getRange(blockRow + 1, 1).setValue("Built " + Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm") + " - CS Visibility v2.5.64. Rates are per available hour (PTO/assumed-off days excluded); raw volume shows onboarding ramp most clearly. CSAT not trended (per-agent monthly samples too small). Run buildThroughput() first, then buildAgentTrends().");
+  Logger.log("Agent Trends built: " + metrics.length + " charts, " + agents.length + " agents, " + months.length + " months.");
+  try { ss.toast("Agent Trends built", "Done", 5); } catch (e) {}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SLACK TIME-OFF (#cscx) - seed + cross-check (v2.5.51)
+// The manager posts a morning "X will be out today" note in #cscx - an authoritative human time-off log.
+// seedSlackTimeOff() writes the crawled off-days to a maintainable "Time Off (Slack)" sheet.
+// crosscheckTimeOff() compares it to the Throughput tab to (a) validate our flagged off-days and
+// (b) catch MISSES: days Slack says an agent was off but our data still counted them available
+// (uncaptured PTO that drags their per-hour rate). It also lists our "assumed off" guesses that
+// Slack did not confirm. Planned next: wire "Time Off (Slack)" into buildThroughput as a layer
+// between calendar PTO and the zero-activity assumption (calendar > Slack > assumed-off).
+// ════════════════════════════════════════════════════════════════════════════
+function seedSlackTimeOff() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  // Off-day seed is loaded from the CS_TIMEOFF_SEED Script Property (JSON) so no
+  // names/dates/reasons are hardcoded. Format: [["Agent Name","YYYY-MM-DD","note"], ...]
+  let seed = [];
+  try {
+    seed = JSON.parse(PropertiesService.getScriptProperties().getProperty("CS_TIMEOFF_SEED") || "[]");
+  } catch (e) {
+    Logger.log("CS_TIMEOFF_SEED is not valid JSON — seeding empty: " + e);
+  }
+  let sheet = ss.getSheetByName("Time Off (Slack)");
+  if (!sheet) sheet = ss.insertSheet("Time Off (Slack)");
+  sheet.clear();
+  const HEAD = ["Agent", "Date", "Source", "Note"];
+  const rows = [HEAD].concat(seed.map(s => [s[0], s[1], "slack #cscx", s[2]]));
+  sheet.getRange(1, 1, rows.length, HEAD.length).setValues(rows);
+  sheet.getRange(1, 1, 1, HEAD.length).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.setFrozenRows(1); sheet.autoResizeColumns(1, HEAD.length);
+  sheet.getRange(rows.length + 2, 1).setValue("Crawled from #cscx morning posts (Dec 2025 - Jun 2026). Maintain by adding rows as the manager posts off-days. Read by crosscheckTimeOff() and (planned) buildThroughput as the Slack PTO layer. v2.5.64.");
+  Logger.log("Time Off (Slack) seeded: " + seed.length + " off-days.");
+}
+
+function crosscheckTimeOff() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = CONFIG.businessHours.timezone;
+  const slackSheet = ss.getSheetByName("Time Off (Slack)");
+  if (!slackSheet || slackSheet.getLastRow() < 2) { Logger.log("crosscheckTimeOff: run seedSlackTimeOff() first."); return; }
+  const thr = ss.getSheetByName("Throughput");
+  if (!thr || thr.getLastRow() < 2) { Logger.log("crosscheckTimeOff: run buildThroughput() first."); return; }
+
+  const sd = slackSheet.getRange(2, 1, slackSheet.getLastRow() - 1, 4).getValues();
+  const slackOff = sd.filter(r => r[0] && r[1]).map(r => ({
+    agent: String(r[0]).trim(),
+    date: (r[1] instanceof Date) ? Utilities.formatDate(r[1], tz, "yyyy-MM-dd") : String(r[1]).substring(0, 10),
+    note: String(r[3] || "")
+  }));
+
+  const td = thr.getRange(1, 1, thr.getLastRow(), thr.getLastColumn()).getValues();
+  const TH = td[0];
+  const ci = { date: TH.indexOf("Date"), agent: TH.indexOf("Agent"), avail: TH.indexOf("Avail hrs"), note: TH.indexOf("Note") };
+  const thrMap = {};
+  for (let i = 1; i < td.length; i++) {
+    const r = td[i];
+    const ds = (r[ci.date] instanceof Date) ? Utilities.formatDate(r[ci.date], tz, "yyyy-MM-dd") : String(r[ci.date]).substring(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(ds) || !r[ci.agent]) continue;
+    thrMap[String(r[ci.agent]).trim() + "|" + ds] = { avail: Number(r[ci.avail]) || 0, note: String(r[ci.note] || "") };
+  }
+
+  const out = [], section = [];
+  out.push(["TIME-OFF CROSS-CHECK - Slack #cscx vs Throughput availability"]);
+  section.push(out.length); out.push(["SLACK OFF-DAYS vs OUR DATA"]);
+  out.push(["Agent", "Date", "Slack note", "Our avail hrs", "Our note", "Verdict"]);
+  let miss = 0, confirmed = 0, norow = 0;
+  slackOff.forEach(o => {
+    const t = thrMap[o.agent + "|" + o.date];
+    let avail = "", note = "", verdict;
+    if (!t) { verdict = "no throughput row (weekend / not scheduled / out of range)"; norow++; }
+    else {
+      avail = t.avail; note = t.note;
+      if (t.avail <= 0) { verdict = "CONFIRMED off"; confirmed++; }
+      else { verdict = "MISS - counted available, should be PTO"; miss++; }
+    }
+    out.push([o.agent, o.date, o.note, avail, note, verdict]);
+  });
+
+  const slackSet = new Set(slackOff.map(o => o.agent + "|" + o.date));
+  const assumed = [];
+  Object.keys(thrMap).forEach(k => {
+    if (/assumed off/i.test(thrMap[k].note) && !slackSet.has(k)) { const p = k.split("|"); assumed.push([p[0], p[1], thrMap[k].note]); }
+  });
+  assumed.sort((a, b) => (a[0] === b[0] ? (a[1] < b[1] ? -1 : 1) : (a[0] < b[0] ? -1 : 1)));
+  out.push([""]);
+  section.push(out.length); out.push(["OUR 'ASSUMED OFF' DAYS NOT CONFIRMED IN SLACK (review: real off the manager didn't post, or a false zero-activity guess)"]);
+  out.push(["Agent", "Date", "Our note"]);
+  assumed.forEach(r => out.push(r));
+
+  out.push([""]);
+  out.push(["SUMMARY: " + confirmed + " confirmed off, " + miss + " MISSES (Slack off but counted available), " + norow + " no-throughput-row; " + assumed.length + " assumed-off not in Slack."]);
+
+  let sheet = ss.getSheetByName("Time Off Crosscheck");
+  if (!sheet) sheet = ss.insertSheet("Time Off Crosscheck");
+  sheet.clear();
+  const w = out.reduce((m, r) => Math.max(m, r.length), 0);
+  out.forEach(r => { while (r.length < w) r.push(""); });
+  sheet.getRange(1, 1, out.length, w).setValues(out);
+  sheet.getRange(1, 1, 1, w).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  section.forEach(idx => sheet.getRange(idx + 1, 1, 1, w).setFontWeight("bold").setBackground("#E1DFDD"));
+  sheet.setFrozenColumns(1); sheet.autoResizeColumns(1, w);
+  sheet.getRange(out.length + 2, 1).setValue("Built " + Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm") + " - v2.5.64. MISS rows = Slack says off but the Throughput counted available hours (uncaptured PTO dragging the per-hour rate). Run seedSlackTimeOff() and buildThroughput() first.");
+  Logger.log("Time Off Crosscheck: " + confirmed + " confirmed, " + miss + " misses, " + norow + " no-row, " + assumed.length + " assumed-not-in-slack.");
+  try { ss.toast("Time Off Crosscheck built", "Done", 5); } catch (e) {}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SUPPORT SIGNAL EXPLORATION (v2.5.64) - read-only probe of the "quality gap"
+// signals that CSAT/throughput can't see. Samples recent tickets and writes an
+// "Exploration" sheet: per-ticket rows + a SUMMARY block. Nothing is changed in
+// Zendesk; this is a one-off look at the data shape. Tune EXPLORE_CONFIG, run
+// exploreSupportSignals(), then read the SUMMARY block at the top of the sheet.
+//   reopen rate        = % of tickets the customer reopened (resolution didn't hold)
+//   repeat-contact     = % of tickets whose requester came back within N days
+//   agent-last dropoff = % of solved tickets where the agent had the last public
+//                        word and the customer never replied (silent give-up proxy)
+//   CSAT response shape = offered vs rated vs good/bad (survivorship of the survey)
+// ════════════════════════════════════════════════════════════════════════════
+const EXPLORE_CONFIG = {
+  windowDays: 60,        // how far back to sample (by created date)
+  maxTickets: 400,       // cap the sample for speed / rate limits
+  dropoffSampleCap: 80,  // tickets to fetch comments for (drop-off needs per-ticket comments)
+  repeatWindowDays: 14   // a repeat contact = same requester back within N days
+};
+
+function exploreSupportSignals() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty("ZENDESK_TOKEN");
+  if (!token) { Logger.log("Missing ZENDESK_TOKEN"); return; }
+  const subdomain = CONFIG.zendesk.subdomain;
+  const tz = CONFIG.businessHours.timezone;
+  const opts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(token), "Content-Type": "application/json" }, muteHttpExceptions: true };
+  const get = url => { const r = UrlFetchApp.fetch(url, opts); return { code: r.getResponseCode(), body: r.getContentText() }; };
+
+  const end = new Date();
+  const start = new Date(end.getTime() - EXPLORE_CONFIG.windowDays * 86400000);
+  const fmt = d => Utilities.formatDate(d, tz, "yyyy-MM-dd");
+  const filter = `-tags:aircall -tags:internal__testing -tags:auto_close -assignee:"AI Agent"`;
+  const query = `type:ticket created>=${fmt(start)} created<=${fmt(end)} ${filter}`;
+
+  // 1) page through tickets in the window
+  const tickets = [];
+  let page = 1;
+  while (tickets.length < EXPLORE_CONFIG.maxTickets && page <= 20) {
+    const url = `https://${subdomain}.zendesk.com/api/v2/search.json?query=${encodeURIComponent(query)}&per_page=100&page=${page}&sort_by=created_at&sort_order=desc`;
+    const r = get(url);
+    if (r.code !== 200) { Logger.log("search " + r.code + ": " + r.body.substring(0, 200)); break; }
+    const data = JSON.parse(r.body);
+    (data.results || []).forEach(t => { if (tickets.length < EXPLORE_CONFIG.maxTickets) tickets.push(t); });
+    if (!data.next_page) break;
+    page++; Utilities.sleep(600);
+  }
+  Logger.log("Explore: pulled " + tickets.length + " tickets over " + EXPLORE_CONFIG.windowDays + " days");
+  if (!tickets.length) { Logger.log("Explore: no tickets, nothing to write."); return; }
+
+  // denominator: total tickets SOLVED in the window (excludes phone/aircall, test, AI bot) =
+  // the population that could have triggered a Nicereply email survey. Uses search count.
+  let solvedDenom = 0;
+  {
+    const dq = `type:ticket solved>=${fmt(start)} solved<=${fmt(end)} ${filter}`;
+    const r = get(`https://${subdomain}.zendesk.com/api/v2/search.json?query=${encodeURIComponent(dq)}&per_page=1`);
+    if (r.code === 200) solvedDenom = JSON.parse(r.body).count || 0;
+    Utilities.sleep(600);
+  }
+
+  // 2) sideload metric_sets (reopens, replies) via show_many, 100 ids at a time
+  const metricsById = {};
+  for (let i = 0; i < tickets.length; i += 100) {
+    const ids = tickets.slice(i, i + 100).map(t => t.id).join(",");
+    const r = get(`https://${subdomain}.zendesk.com/api/v2/tickets/show_many.json?ids=${ids}&include=metric_sets`);
+    if (r.code === 200) { (JSON.parse(r.body).metric_sets || []).forEach(m => { metricsById[m.ticket_id] = m; }); }
+    Utilities.sleep(600);
+  }
+
+  // 3) repeat-contact: how many requesters appear more than once in the window
+  const byRequester = {};
+  tickets.forEach(t => { (byRequester[t.requester_id] = byRequester[t.requester_id] || []).push(t); });
+  const repeatTickets = tickets.filter(t => (byRequester[t.requester_id] || []).length > 1).length;
+
+  // 4) drop-off subsample: last public comment author. If the last public comment
+  //    is NOT the requester (i.e. an agent), and the ticket is solved/closed, the
+  //    customer never got the last word -> agent-last drop-off candidate.
+  const solvedSet = new Set(["solved", "closed"]);
+  const sample = tickets.slice(0, EXPLORE_CONFIG.dropoffSampleCap);
+  const lastPartyById = {};
+  let agentLast = 0, custLast = 0, evaluated = 0;
+  sample.forEach(t => {
+    const r = get(`https://${subdomain}.zendesk.com/api/v2/tickets/${t.id}/comments.json?per_page=100`);
+    if (r.code === 200) {
+      const comments = (JSON.parse(r.body).comments || []).filter(c => c.public);
+      if (comments.length) {
+        const lastAuthor = comments[comments.length - 1].author_id;
+        const party = (lastAuthor === t.requester_id) ? "customer" : "agent";
+        lastPartyById[t.id] = party;
+        evaluated++;
+        if (solvedSet.has(t.status)) { if (party === "agent") agentLast++; else custLast++; }
+      }
+    }
+    Utilities.sleep(700);
+  });
+
+  // 5) tallies
+  const n = tickets.length;
+  const reopened = tickets.filter(t => (metricsById[t.id] && metricsById[t.id].reopens > 0)).length;
+  const sat = { offered: 0, good: 0, bad: 0, unoffered: 0, other: 0 };
+  const statusDist = {};
+  tickets.forEach(t => {
+    const s = (t.satisfaction_rating && t.satisfaction_rating.score) ? t.satisfaction_rating.score : "unoffered";
+    if (s in sat) sat[s]++; else sat.other++;
+    statusDist[t.status] = (statusDist[t.status] || 0) + 1;
+  });
+  const rated = sat.good + sat.bad;
+  const pct = (a, b) => b ? (Math.round(a / b * 1000) / 10) + "%" : "n/a";
+
+  // support-dark: solved/closed tickets where the agent never publicly replied (replies==0),
+  // plus first-reply-time distribution. Both from metric_sets (full sample, no extra API calls).
+  // merge detection: a merged-away ticket closes with the reply on the target, so it shows
+  // replies=0. Zendesk tags those "closed_by_merge"; catch any tag containing "merge".
+  const isMerge = t => (t.tags || []).some(x => /merge/i.test(String(x)));
+  let solvedClosed = 0, noAgentReply = 0, noReplyMerge = 0; const firstReplyMins = [];
+  const noReplyByChannel = {}; let mailSolved = 0, mailNoReply = 0, mailNoReplyMerge = 0;
+  tickets.forEach(t => {
+    const m = metricsById[t.id];
+    const ch = (t.via && t.via.channel) ? t.via.channel : "unknown";
+    const merged = isMerge(t);
+    if (solvedSet.has(t.status)) {
+      solvedClosed++;
+      const noRep = !(m && m.replies);
+      if (noRep) { noAgentReply++; if (merged) noReplyMerge++; noReplyByChannel[ch] = (noReplyByChannel[ch] || 0) + 1; }
+      if (ch === "email") { mailSolved++; if (noRep) { mailNoReply++; if (merged) mailNoReplyMerge++; } }
+    }
+    if (m && m.reply_time_in_minutes) {
+      const rt = (m.reply_time_in_minutes.business != null ? m.reply_time_in_minutes.business : m.reply_time_in_minutes.calendar);
+      if (rt != null && rt > 0) firstReplyMins.push(rt);
+    }
+  });
+  // deeper merge check: most merges are NOT tagged. For email + replies=0 + solved tickets not
+  // already tag-flagged, fetch comments and look for Zendesk's merge system message. Definitive
+  // but costs one call per candidate, so the run is slower.
+  // The metric_sets.replies field is unreliable (misses outbound-initiated, bounced, and
+  // archived/closed tickets), so verify each email no-reply candidate against its comments:
+  // a merge system-message means merged; a public comment by a non-requester means an agent
+  // actually replied (metric was wrong); neither means genuinely unanswered.
+  const mergeRe = /merged into request|closed and merged|requests merged|merged into ticket|into request #|into this request/i;
+  const mergeAuditSet = new Set();   // untagged merges found via the merge system-message
+  const repliedSet = new Set();      // replies metric said 0 but a public agent comment exists
+  const mergeCandidates = tickets.filter(t => solvedSet.has(t.status) && ((t.via && t.via.channel) === "email") && !(metricsById[t.id] && metricsById[t.id].replies) && !isMerge(t));
+  mergeCandidates.slice(0, 150).forEach(t => {
+    const r = get(`https://${subdomain}.zendesk.com/api/v2/tickets/${t.id}/comments.json?per_page=100`);
+    if (r.code === 200) {
+      const cs = JSON.parse(r.body).comments || [];
+      if (cs.some(c => mergeRe.test(String(c.plain_body || c.body || "")))) { mergeAuditSet.add(t.id); }
+      else if (cs.some(c => c.public && c.author_id && c.author_id !== t.requester_id)) { repliedSet.add(t.id); }
+    }
+    Utilities.sleep(700);
+  });
+  const mailMergeAudit = mergeAuditSet.size;
+  const mailReplied = repliedSet.size;
+  const mailNoReplyReal = mailNoReply - mailNoReplyMerge - mailMergeAudit - mailReplied;
+
+  const median = arr => { if (!arr.length) return null; const s = arr.slice().sort((a, b) => a - b); const mid = Math.floor(s.length / 2); return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2; };
+  const fmtDur = mins => mins == null ? "n/a" : (mins < 60 ? Math.round(mins) + "m" : (Math.round(mins / 60 * 10) / 10) + "h");
+  const medFR = median(firstReplyMins);
+
+  // 5b) join Nicereply CES (email survey, Q2 "Deako made it easy", 1-7) from the "Nicereply Import" sheet
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cesByTicket = {}; const cesAll = []; let cesResp = 0;
+  const nrSheet = ss.getSheetByName("Nicereply Import");
+  if (nrSheet && nrSheet.getLastRow() > 1) {
+    const nd = nrSheet.getRange(1, 1, nrSheet.getLastRow(), nrSheet.getLastColumn()).getValues();
+    const nh = nd[0].map(String);
+    const iTk = nh.indexOf("ticket"), iCr = nh.indexOf("created"), iCes = nh.findIndex(h => h.indexOf("2 - Score") === 0);
+    if (iTk >= 0 && iCes >= 0) {
+      for (let i = 1; i < nd.length; i++) {
+        const tk = String(nd[i][iTk] || "").trim(); const raw = nd[i][iCes];
+        if (!tk || raw === "" || raw == null) continue;
+        const ces = Number(raw); if (isNaN(ces)) continue;
+        cesByTicket[tk] = ces; cesAll.push(ces);
+        const cr = iCr >= 0 ? String(nd[i][iCr] || "").substring(0, 10) : "";
+        if (cr >= fmt(start) && cr <= fmt(end)) cesResp++;
+      }
+    }
+  }
+  const cesLow = cesAll.filter(x => x <= 4).length;
+  const cesMean = cesAll.length ? Math.round(cesAll.reduce((a, b) => a + b, 0) / cesAll.length * 100) / 100 : 0;
+
+  // 6) write the Exploration sheet
+  let sheet = ss.getSheetByName("Exploration");
+  if (!sheet) sheet = ss.insertSheet("Exploration");
+  sheet.clear();
+  const out = [];
+  out.push(["SUPPORT SIGNAL EXPLORATION - read-only sample, " + fmt(start) + " to " + fmt(end)]);
+  out.push([""]);
+  out.push(["SUMMARY", "", ""]);
+  out.push(["Tickets sampled", n, ""]);
+  out.push(["Reopen rate", pct(reopened, n), reopened + " of " + n + " reopened by customer (benchmark: <5% good, >10% red flag)"]);
+  out.push(["Repeat-contact rate", pct(repeatTickets, n), repeatTickets + " tickets from requesters with >1 ticket in the window"]);
+  out.push(["Agent-last drop-off (subsample)", pct(agentLast, agentLast + custLast), agentLast + " agent-last of " + (agentLast + custLast) + " solved tickets evaluated (" + evaluated + " sampled)"]);
+  out.push(["CSAT survey: rated", pct(rated, n), rated + " rated (" + sat.good + " good / " + sat.bad + " bad) of " + n + " - the rest are silent"]);
+  out.push(["CSAT among responders", pct(sat.good, rated), "satisfaction only reflects the " + pct(rated, n) + " who answered"]);
+  out.push(["Status mix", Object.keys(statusDist).map(k => k + ":" + statusDist[k]).join(", "), ""]);
+  out.push(["Email-solved in window (denominator)", solvedDenom, "tickets solved in the window that could trigger a Nicereply survey"]);
+  out.push(["Nicereply responses in window", cesResp, "from the Nicereply Import sheet, created within the window"]);
+  out.push(["CES survey response rate", pct(cesResp, solvedDenom), "responses / email-solved - this is the survivorship number"]);
+  out.push(["CES Q2 made-it-easy (all responses)", cesMean + "/7", cesAll.length + " responses; " + pct(cesLow, cesAll.length) + " rated high-effort (<=4)"]);
+  out.push(["Solved with no agent public reply (all channels)", pct(noAgentReply, solvedClosed), noAgentReply + " of " + solvedClosed + " solved/closed had replies=0 - UPPER BOUND, includes api/phone/system"]);
+  out.push(["  no-reply by channel", Object.keys(noReplyByChannel).sort((a, b) => noReplyByChannel[b] - noReplyByChannel[a]).map(k => k + ":" + noReplyByChannel[k]).join(", "), "tests the api/system-generated hypothesis"]);
+  out.push(["No-reply rate, email-origin only (via=email)", pct(mailNoReply, mailSolved), mailNoReply + " of " + mailSolved + " email-channel solved tickets had no agent reply"]);
+  out.push(["  merges by tag (email)", mailNoReplyMerge, "merged tickets close with replies=0 - reply lives on the target"]);
+  out.push(["  + merges by audit, untagged (email)", mailMergeAudit, "merge system-message found in comments though no merge tag"]);
+  out.push(["  + agent DID reply (replies metric wrong)", mailReplied, "public agent comment exists though metric_sets.replies said 0 - outbound/bounced/archived"]);
+  out.push(["No-reply, email, VERIFIED unanswered", pct(mailNoReplyReal, mailSolved), mailNoReplyReal + " of " + mailSolved + " - no merge and no public agent comment, confirmed via comments"]);
+  out.push(["Median first reply time", fmtDur(medFR), firstReplyMins.length + " tickets with a reply; business-hours, from metric_sets"]);
+  out.push([""]);
+  out.push(["PER-TICKET SAMPLE", "", "", "", "", "", "", ""]);
+  out.push(["Ticket", "Created", "Status", "Channel", "Replies", "Flag", "Reopens", "CES (email)", "CSAT score", "Last public party", "Subject"]);
+  tickets.forEach(t => {
+    const m = metricsById[t.id] || {};
+    out.push([
+      t.id,
+      Utilities.formatDate(new Date(t.created_at), tz, "yyyy-MM-dd"),
+      t.status,
+      (t.via && t.via.channel) ? t.via.channel : "unknown",
+      (m.replies != null ? m.replies : ""),
+      (isMerge(t) ? "merge" : (mergeAuditSet.has(t.id) ? "merge*" : (repliedSet.has(t.id) ? "replied*" : ""))),
+      (m.reopens != null ? m.reopens : ""),
+      (cesByTicket[String(t.id)] != null ? cesByTicket[String(t.id)] : ""),
+      (t.satisfaction_rating && t.satisfaction_rating.score) ? t.satisfaction_rating.score : "unoffered",
+      lastPartyById[t.id] || "",
+      (t.subject || "").substring(0, 80)
+    ]);
+  });
+
+  const w = out.reduce((mx, r) => Math.max(mx, r.length), 0);
+  out.forEach(r => { while (r.length < w) r.push(""); });
+  sheet.getRange(1, 1, out.length, w).setValues(out);
+  sheet.getRange(1, 1, 1, w).setFontWeight("bold").setBackground("#1B3747").setFontColor("#FFFFFF");
+  sheet.getRange(3, 1, 1, w).setFontWeight("bold").setBackground("#E1DFDD");
+  sheet.getRange(24, 1, 1, w).setFontWeight("bold").setBackground("#E1DFDD");
+  sheet.getRange(25, 1, 1, w).setFontWeight("bold");
+  sheet.setFrozenRows(1);
+  sheet.getRange(out.length + 2, 1).setValue("Built " + Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm") + " - CS Visibility v2.5.64. Read-only probe (no Zendesk writes). Drop-off is a subsample (EXPLORE_CONFIG.dropoffSampleCap) because it needs per-ticket comments; reopen/repeat/CSAT cover the full sample. CES is NOT here yet - tell me where that survey lives to fold it in.");
+  Logger.log("Explore done: reopen " + pct(reopened, n) + ", repeat " + pct(repeatTickets, n) + ", agent-last " + pct(agentLast, agentLast + custLast) + ", rated " + pct(rated, n));
+  try { ss.toast("Exploration built", "Done", 5); } catch (e) {}
+}
+
+// ============================================================
+// ZENDESK FIELD AUDIT  (added v2.5.64)
+// One-time, manual-run, read-only probe. No triggers, no Zendesk writes.
+// Answers: which ticket fields actually get filled, and with what values?
+// Feeds the Ticket Signal Engine ground-truth decision (Device field revival,
+// Customer Stated Problem / Issue and Resolution as agent-authored truth,
+// Item(s) Being Returned for RMA correlation).
+// Run auditTicketFields() from the editor. Writes the "Zendesk Field Audit" tab.
+// ============================================================
+
+const FIELD_AUDIT_CONFIG = {
+  lookbackDays: 90,        // sample window: solved in the last N days
+  maxPages: 5,             // 100 tickets per page; search API caps at 1000
+  topValuesPerField: 12,   // value distribution cap per field
+  sheetName: "Zendesk Field Audit",
+};
+
+function auditTicketFields() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty("ZENDESK_TOKEN");
+  if (!token) throw new Error("ZENDESK_TOKEN not set in Script Properties");
+
+  const subdomain = CONFIG.zendesk.subdomain;
+  const authHeader = "Basic " + Utilities.base64Encode(token);
+  const zdOpts = { method: "get", headers: { "Authorization": authHeader, "Content-Type": "application/json" }, muteHttpExceptions: true };
+
+  // ---- 1. Field definitions (id -> title, type, option value->label map) ----
+  const fieldDefs = {};
+  let fieldsUrl = `https://${subdomain}.zendesk.com/api/v2/ticket_fields.json?page[size]=100`;
+  let guard = 0;
+  while (fieldsUrl && guard < 10) {
+    guard++;
+    const resp = UrlFetchApp.fetch(fieldsUrl, zdOpts);
+    if (resp.getResponseCode() !== 200) throw new Error("ticket_fields.json returned " + resp.getResponseCode());
+    const data = JSON.parse(resp.getContentText());
+    (data.ticket_fields || []).forEach(f => {
+      const optionMap = {};
+      (f.custom_field_options || []).forEach(o => { optionMap[o.value] = o.name; });
+      fieldDefs[String(f.id)] = {
+        title: f.title || "(untitled)",
+        type: f.type || "?",
+        active: !!f.active,
+        required: !!(f.required || f.required_in_portal),
+        optionMap: optionMap,
+        optionCount: (f.custom_field_options || []).length,
+      };
+    });
+    fieldsUrl = (data.links && data.links.next) ? data.links.next : null;
+  }
+  Logger.log("Field audit: " + Object.keys(fieldDefs).length + " field definitions fetched");
+
+  // ---- 2. Sample recent solved tickets (same exclusions as the classifier) ----
+  const start = new Date(Date.now() - FIELD_AUDIT_CONFIG.lookbackDays * 86400000);
+  const startStr = Utilities.formatDate(start, "UTC", "yyyy-MM-dd");
+  const solvedFilter = `-tags:aircall -tags:internal__testing -tags:auto_close -assignee:"AI Agent"`;
+  const query = `type:ticket solved>=${startStr} ${solvedFilter}`;
+
+  const stats = {}; // fieldId -> { filled, textLenSum, textCount, values: {label: count} }
+  let sampled = 0;
+
+  for (let page = 1; page <= FIELD_AUDIT_CONFIG.maxPages; page++) {
+    const url = `https://${subdomain}.zendesk.com/api/v2/search.json?query=${encodeURIComponent(query)}&per_page=100&page=${page}&sort_by=created_at&sort_order=desc`;
+    const resp = UrlFetchApp.fetch(url, zdOpts);
+    if (resp.getResponseCode() !== 200) { Logger.log("Search page " + page + " returned " + resp.getResponseCode()); break; }
+    const results = JSON.parse(resp.getContentText()).results || [];
+    if (results.length === 0) break;
+
+    results.forEach(ticket => {
+      sampled++;
+      const cfs = ticket.custom_fields || ticket.fields || [];
+      cfs.forEach(cf => {
+        const id = String(cf.id);
+        if (!stats[id]) stats[id] = { filled: 0, textLenSum: 0, textCount: 0, values: {} };
+        const v = cf.value;
+
+        // Unfilled: null, "", empty array, false (unchecked checkbox)
+        const isEmpty = (v === null || v === undefined || v === "" || v === false || (Array.isArray(v) && v.length === 0));
+        if (isEmpty) return;
+
+        stats[id].filled++;
+        const def = fieldDefs[id] || { optionMap: {}, type: "?" };
+
+        if (Array.isArray(v)) {
+          v.forEach(item => {
+            const label = def.optionMap[item] || String(item);
+            stats[id].values[label] = (stats[id].values[label] || 0) + 1;
+          });
+        } else if (typeof v === "string" && def.optionCount === 0 && v.length > 30) {
+          // free text: track length, not content (avoid dumping PII into the sheet)
+          stats[id].textLenSum += v.length;
+          stats[id].textCount++;
+        } else {
+          const label = def.optionMap[v] !== undefined ? def.optionMap[v] : String(v).substring(0, 60);
+          stats[id].values[label] = (stats[id].values[label] || 0) + 1;
+        }
+      });
+    });
+
+    if (results.length < 100) break;
+    Utilities.sleep(300); // be polite to the search API
+  }
+  if (sampled === 0) throw new Error("No solved tickets found in lookback window");
+
+  // ---- 3. Build output rows: every field definition, usage stats merged in ----
+  const rows = [];
+  Object.keys(fieldDefs).forEach(id => {
+    const def = fieldDefs[id];
+    const s = stats[id] || { filled: 0, textLenSum: 0, textCount: 0, values: {} };
+    const fillPct = sampled ? (100 * s.filled / sampled) : 0;
+    const avgLen = s.textCount ? Math.round(s.textLenSum / s.textCount) : "";
+    const topValues = Object.entries(s.values)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, FIELD_AUDIT_CONFIG.topValuesPerField)
+      .map(([label, count]) => `${label} (${count})`)
+      .join(" | ");
+    rows.push([
+      Number(id),
+      def.title,
+      def.type,
+      def.active ? "yes" : "no",
+      def.required ? "yes" : "no",
+      def.optionCount || "",
+      s.filled,
+      fillPct.toFixed(1) + "%",
+      avgLen,
+      topValues,
+    ]);
+  });
+  // Sort: highest fill count first, inactive/zero-fill sink to the bottom
+  rows.sort((a, b) => b[6] - a[6]);
+
+  // ---- 4. Write the tab ----
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = getOrCreateSheet(ss, FIELD_AUDIT_CONFIG.sheetName);
+  sheet.clear();
+
+  const tz = ss.getSpreadsheetTimeZone();
+  sheet.getRange(1, 1).setValue("Zendesk Field Audit").setFontWeight("bold").setFontSize(12);
+  sheet.getRange(2, 1).setValue(`Sample: ${sampled} solved tickets since ${startStr} (classifier exclusions applied). Fill % = tickets where the field had a non-empty value. Free-text fields show average length instead of values (content not dumped).`);
+
+  const headers = ["Field ID", "Display Name", "Type", "Active", "Required", "# Options", "Filled", "Fill %", "Avg Text Len", "Top Values (count)"];
+  headers.forEach((h, i) => sheet.getRange(4, i + 1).setValue(h).setFontWeight("bold").setBackground(BRAND.beigeLight));
+  if (rows.length) sheet.getRange(5, 1, rows.length, headers.length).setValues(rows);
+  sheet.setFrozenRows(4);
+  sheet.autoResizeColumns(1, headers.length);
+
+  sheet.getRange(rows.length + 6, 1).setValue("Built " + Utilities.formatDate(new Date(), tz, "yyyy-MM-dd HH:mm") + " - CS Visibility v2.5.64. One-time read-only audit for the Ticket Signal Engine ground-truth plan. Key fields to inspect: Device (360040241554), Customer Stated Problem (32163944763287), Issue and Resolution (32163915171479), Item(s) Being Returned (37702333455767), Date Replacement(s) Sent (32237288443415).");
+  Logger.log("Field audit done: " + sampled + " tickets sampled, " + rows.length + " fields written to '" + FIELD_AUDIT_CONFIG.sheetName + "'");
+  try { ss.toast("Field audit built (" + sampled + " tickets)", "Done", 5); } catch (e) {}
+}
+
+// Grounding reference embedded from product_reference.csv + feature_glossary.csv + classifier_disambiguation_notes.md (v1, 2026-06-11)
+const GROUNDING_REFERENCE_V1 = "# GROUNDING REFERENCE v1 (product disambiguation)\n\nUse this reference to map customer language to the correct product_primary and features. Quote the distinguishing evidence before assigning a specific product; if the evidence does not support a specific model, stop at a broader value (Smart Product - Unspecified / Simple Product - Unspecified) or Unknown / Not Mentioned.\n\n## PRODUCT REFERENCE (canonical_name, family, class, aliases, discriminator, common_symptoms)\n\ncanonical_name,family,class,aliases,discriminator,common_symptoms\nSmart Switch,Switch,Smart,\"gen 1|gen one|original smart switch|smart light switch|deco switch|wifi switch\",\"Gen 1 app-connected on/off switch, model DS2005, serial prefix 221. Plain paddle PLUS a small LED configure button at bottom center of the face; no Beacon light bar (that is Gen 2). No dimming. Multiway requires manual linking via configure button (green/purple/white sequence), not Magic Linking. Cannot share a circuit with Gen 2 (different Bluetooth); mixed generations each act as single-pole. Many Gen 1 units were shipped 2020-2023 as the Deako Connect upgrade path.\",\"won't connect to wifi|dropped offline|gen 1 no longer working|flashing blue|can't pair|not showing in the app|flashing white and red (wifi/server failure)|flashing red and yellow (critical error)\"\nSmart Switch Gen 2,Switch,Smart,\"gen 2|gen two|new smart switch|smart switch 2023|generation 2|the one with the light bar\",\"Current flagship, model DS2023, serial prefix 322. Visible tell: Beacon light bar built into the face (Gen 1 has only a small bottom-center LED). Beacon has app-set Status Mode (lit = lights on) and Locator Mode (soft glow in dark; customers may mistake this for a nightlight). Magic Linking auto-configures multiway. Requires the NEW Deako app; old app will not work. Cannot mix with Gen 1 or Simple in the same circuit.\",\"flashes blue then pair light goes away|won't stay online|factory reset flashes purple not red|keeps going offline|beacon light won't turn off|blinking red (error)|solid red (factory resetting)|blinking purple (linking or OTA update)\"\nSmart Switch Multiway,Switch,Smart,\"multi-way smart switch|3 way smart switch|three way smart switch\",\"Serial prefix 220. Legacy catalog distinction: current Gen 2 handles all circuit types as one SKU, so this value mostly appears on older units/tickets. Assign only when multiway wiring is explicit.\",\"one location works the other doesn't|3-way not working|each switch acting independently\"\nSingle Pole Smart Dimmer,Dimmer,Smart,\"single pole dimmer|smart dimmer|dimmer with the little lights|up and down buttons|push the dimmer up and down\",\"Model DS2010, serial prefix 231, SKU DS-CD1M. Rocker-style dimming (press/hold paddle up or down) with a vertical 7-LED dim level indicator, plus bottom-center configure LED. NOT a slider (slider = Simple Dimmer). Single-pole only: one switch location, no companion. If a second dimmer location or master/remote pairing is mentioned, it is Master/Remote instead. Min/max dim trim set in app, not on device.\",\"won't dim from app|buttons unresponsive|dim level LEDs stuck|no power in single pole room|only dims partway|flashing blue (pairing)|flashing purple (linking)\"\nMaster Smart Dimmer,Dimmer,Smart,\"master dimmer|main dimmer|dimmer with two switches|3 way dimmer\",\"Model DS2011, serial prefix 232, SKU DS-CD3M. Same face as other Smart Dimmers (rocker + 7-LED bar); the word Master is printed on the BACK of the unit. Primary load-controlling dimmer in 3-way/4-way circuits, always paired with Remote(s). Customer tell: a dimmer setup with two or more switch locations. Often replaced as a Master+Remote pair.\",\"remote not syncing to master|trouble connecting master and remote|pairing failure|dimming jumps or flickers|linking error (flashing purple and red)\"\nRemote Smart Dimmer,Dimmer,Smart,\"remote dimmer|the remote|second dimmer|companion dimmer\",\"Model DS2012, serial prefix 233, SKU DS-CDRM. Identical face to Master; the word Remote is printed on the BACK. Companion in multiway circuits: carries no load, wirelessly follows the Master. Never standalone; if no Master is mentioned, reconsider. Usually replaced alongside Master.\",\"not syncing to master|remote unresponsive|second switch does nothing|links then drops\"\nSmart Plug,Plug,Smart,\"plug-in|plugin|smart outlet|plug in module\",\"Plug-in module, serial prefix 250, not in-wall. One manual on/off button on the SIDE; cord-side form factor that does not block the second outlet. Indoor only (outdoor use voids warranty). CAUTION: customers say smart outlet for this; all in-wall Deako outlets are simple, so smart outlet almost always means Smart Plug.\",\"won't connect to wifi|was connected and now isn't|can't pair|side button does nothing\"\nSingle Pole Rocker,Switch,Simple,\"rocker|paddle|regular switch|toggle switch|simple switch|normal switch\",\"Serial prefix 013, SKU family SS4N. Large plain white paddle and nothing else: no LED, no slider, no buttons, no app. The most featureless Deako switch. Vs Gen 1 Smart Switch (looks similar): Gen 1 has the small LED configure button at bottom center. Current retail SKU works in single-pole, 3-way and 4-way.\",\"paddle sticks|doesn't spring back|switch went bad|pressed down firmly to work|multiple switches failing in one home (possible batch defect)\"\n3-Way Rocker,Switch,Simple,\"3 way switch|three way rocker\",\"Serial prefix 016. Mechanical rocker in a 3-way circuit; physically identical paddle to Single Pole Rocker. Assign only when multiway wiring is explicit; current retail product is one unified SKU.\",\"one of the 3-way switches stopped working|dead end 3-way question\"\nMultiway Rocker,Switch,Simple,\"multi-way rocker|4 way switch\",\"Serial prefix 012. Mechanical rocker in a 4-way+ circuit. Same paddle as other rockers; wiring context is the only tell.\",\nSimple Dimmer,Dimmer,Simple,\"the slidey one|slider|dimmer slider|slider dimmer|dimmer with a slider|dimmer sliders\",\"Serial prefix 061, SKU DS-SD3N. Physical slide lever for brightness plus a trim wheel for bulb compatibility; NO LEDs anywhere, no app. Vs Smart Dimmer: smart dims via rocker press with a 7-LED level bar. A slider that won't stay or feels loose is this product. Multiway allowed but only ONE Simple Dimmer per circuit (rockers at other locations).\",\"slider won't stay|slider doesn't hold position|dimmer slide loose|buzzing when swapped in for rocker|lights flicker at low end (trim wheel adjustment)\"\nSimple Dimmer (Square),Dimmer,Simple,\"square dimmer\",\"Serial prefix 062. Square-faced variant, same slider behavior as Simple Dimmer. Serial is the reliable tell. AUDIT: confirm how agents distinguish it in tickets beyond the serial.\",\nMotion Switch,Switch,Simple,\"motion sensor|sensor switch|simple sensor switch|occupancy switch\",\"Simple class confirmed (SKU DS-SM1N, serial prefix 070). Visible motion sensor window on the face; auto-off timer set AT THE SWITCH to 30 seconds, 5 minutes, or 20 minutes; occupancy and vacancy modes. Single-pole only; no app. Vs Ventilation/Simple Timer: motion triggers on movement, timers are button-started. If installed in a multiway it will not work correctly (fits but misbehaves).\",\"turns on but does not turn off|motion not triggering|lights turn on by themselves|falsely triggers continuously|auto-off too fast or never|stops detecting\"\nFan Speed Controller,Switch,Simple,\"fan switch|ceiling fan controller|fan controller|rocker fan switch\",\"Simple class (serial prefix 014). Rocker for on/off PLUS a 3-position slide knob (low/medium/high): the only Deako device with a detented speed slider. Controls paddle-fan SPEED only: NOT the fan's light, NOT exhaust fans, NOT smart fans or fans with remotes. Single-pole only. Vs Simple Dimmer: dimmer slider is continuous and controls lights.\",\"fan works but light doesn't (light is not this switch's job)|switch smelled burned|fan won't change speed|hum at low speed\"\nAstronomical Timer,Switch,Simple,\"sunset switch|dusk to dawn switch|astro timer|switch with the screen\",\"Serial prefix 015. The ONLY Deako switch with a backlit screen and programming buttons. 7-day schedule, sunrise/sunset tracking with offset (internal clock, no photocell), Random vacation mode, countdown timer. No app, no WiFi. If the customer has a SMART product and wants sunset automation, that is the Schedules app feature, not this SKU.\",\"lights don't come on at sunset|stays on past sunrise|screen blank|clock drifted|how to program the screen\"\nNightlight,Switch,Simple,\"night light switch|switch with the built-in night light|backlight switch|glowing switch\",\"SKU DS-SN3N, serial prefix 017. Rocker with integrated warm-white guide light controlled by a daylight sensor (glows when dark). Single-pole only, no app, no timer buttons. CAUTION: Smart Switch Gen 2 in Locator Mode also glows softly; Gen 2 glow comes from the Beacon bar and is app-configurable, Nightlight glow is fixed warm-white. Family is Switch (not Accessory).\",\"night light gives off no light|backlight fading|glow won't turn off|not staying on\"\nVentilation Timer,Switch,Simple,\"timer switch|fan timer|timed buttons|bathroom fan timer\",\"Serial prefix 018. Fixed countdown buttons (10/30/60 min) plus continuous mode; on/off only, no dimming, single-pole only. ASHRAE 62.2 / Title 24 compliant, marketed for exhaust fans. CAUTION: physically near-identical to the Simple Timer Switch (same 10/30/60 buttons, same body); labeling/intent is the only separator, so a timer on a bathroom fan is ambiguous between the two. Taxonomy currently lacks a Simple Timer value (see notes file). Vs Astronomical Timer: countdown buttons, no screen.\",\"10/30/60 buttons|turns off after time|on or off only|don't know how to turn it off|fan keeps running\"\nBackplate (Wired),Accessory,,\"back plate|backplate|connector|deako connector|the base|backplate that screws into the electrical\",\"Wired in-wall base, serial 000-003 (1-4 gang), 005-008 with outlet. Officially renamed Deako Connector (2026), so connector now appears in builder/EC language. Neutral required at every gang; size-matched 1:1 to the junction box. Wiring is touched once at install, never again. Safety note: backplate failures can present as fire/burn reports; severity-flag these.\",\"caught fire|burning smell at the wall|switch won't seat|no power at any switch in the gang\"\nBackplate (Quick Wire),Accessory,,\"quick wire backplate|quick wire connector\",\"Quick-wire variant, serial 00B-00E (empty variants 00F-00I). Customers sometimes read these serials off the box (starts 00B).\",\nBackplate (Universal),Accessory,,\"universal backplate|universal connector\",\"Universal variant, serial 00J-00M.\",\nFaceplate (Standard),Accessory,,\"plates|cover plate|wall plate|trim|snap on cover\",\"Screwless snap-on cosmetic plate (DS-FP series), 1-4 gang, removed by pulling corners. Compatible with every Deako switch including Gen 2. Customers ordering rockers and plates means rocker switches plus faceplates.\",\"plate won't snap on|corner cracked|gap around switch\"\nFaceplate (Medallion),Accessory,,\"medallion\",\"Medallion collection faceplate (decor line).\",\nFaceplate (Beswitched),Accessory,,\"beswitched\",\"Beswitched collection faceplate (decor line).\",\nSimple Outlet,Outlet,Simple,\"regular outlet|wall outlet\",\"Standard 15A tamper-resistant receptacle (NEMA 5-15R), hardwired: does NOT use the modular switch backplate system. Sold with or without screwless cover (two listings, same outlet). Customer saying smart outlet means Smart Plug, not this.\",\"outlet dead|cover won't snap on\"\nUSB Outlet,Outlet,Simple,\"usb outlet|outlet with usb ports\",\"Outlet with visible USB-A (2.4A) + USB-C (3.0A) ports. Hardwired, not modular.\",\"usb ports stopped charging|charges slowly\"\nGFCI Outlet,Outlet,Simple,\"gfci|gfi outlet\",\"20A GFCI receptacle (NEMA 5-20R) with test/reset buttons; bathroom/kitchen variant. Hardwired, not modular.\",\"keeps tripping|won't reset|test button stuck\"\nOutlet Covers,Accessory,,\"outlet cover|screwless cover\",\"Screwless snap-on covers for Deako outlets (DO-F series). Different SKU family from switch faceplates (DS-FP).\",\nDeako App (iOS),App,,\"the app|iphone app|deako app|deco app|geico app (misheard)\",\"iOS mobile app. Gen 2 requires the NEW app version; old app does not work with Gen 2. Phone transcriptions garble Deako into Deco or GEICO.\",\"app crashes|won't log in|app won't load|switch not showing in the app|can't get into my account\"\nDeako App (Android),App,,\"the app|android app|deco app\",\"Android mobile app. Same Gen 2 new-app requirement.\",\"app crashes|won't log in|app won't load\"\nDeako App (Web / Cloud),App,,\"website|web app|cloud\",\"Web/cloud interface.\",\"can't log in on the website|commands fail remotely but work at home (cloud vs local)\"\nSmart Scene Controller Dimmer,Dimmer,Smart,\"scene controller|touch dimmer\",\"LEGACY (SKU DS-CDMB), not in taxonomy v11 value list. Capacitive-touch dimmer with known self-toucher failure (activates or changes brightness without input); replacement cluster 2021-2022, resolved by current-gen Smart Dimmer replacement. AUDIT: add to taxonomy or define mapping.\",\"turns on by itself|changes brightness on its own|self toucher\"\nSmart Scene Controller Switch,Switch,Smart,\"scene controller switch\",\"LEGACY (SKU DS-CSMB), not in taxonomy v11 value list. AUDIT: same mapping decision as Scene Controller Dimmer.\",\nDeako Connect,Accessory,Smart,\"connect|the hub|bridge\",\"LEGACY discontinued hub (SKU DP-BRLM). End of life; customers migrated free to Smart Switch (historically Gen 1, now Gen 2) via support draft order. Not in taxonomy v11 list. CAUTION: do not confuse with Deako Connector (the renamed backplate). AUDIT: map to a taxonomy value.\",\"hub no longer supported|told to upgrade my connect|old system stopped working\"\n\n## FEATURE GLOSSARY (feature, what_it_does, customer_phrases, confused_with)\n\nfeature,what_it_does,customer_phrases,confused_with\nTimers,Turns a switch off after a set duration (app feature on smart products),\"turn off after X minutes|fan timer|shuts off on its own|set a timer on it\",\"Schedules (timers are duration-based; schedules are clock/sun-based). Customers say timer for both: a timer firing at a clock time or sunset is a Schedule. Also confused with hardware timer SKUs: Ventilation/Simple Timer (10/30/60 buttons, no app) and Motion Switch auto-off (30s/5min/20min set at the switch).\"\nSchedules,Turns lights on/off on a time-based or sunrise/sunset schedule (app feature),\"schedule|comes on at sunset|sun up and sunset|goes on/off at a set time|on a timer (customers often say timer)|turn on automatically|porch light won't come on automatically|light setting depending on time|light switch timers\",\"Timers; Home/Away control; Astronomical Timer SKU (hardware sun-switching with a screen, no app). Rule: smart product + sun-based ask = Schedules feature; simple product with a screen = Astro Timer SKU.\"\nGroups,Controls multiple lights together as one group (app feature),\"group|control all the lights together|tap the group|the group of lights|combined them into groups|asks if I want to set up a group\",\"Scenes; Schedules. Tell: a group is a set of lights acting as one on/off/dim target with one shared state. Repeated taps to get a group to respond is a Groups issue, not Scheduling/Scenes.\"\nScenes,Sets multiple lights to preset levels/states at once (app feature),\"scene|preset|movie mode|set the mood|control all lights from one switch\",\"Groups. Tell: a scene sets different levels per light in one action; a group is one shared state. Official answer for whole-house control from one switch is a Scene.\"\nHome/Away control,Turn lights on/off remotely from the app while home or away,\"control from my phone|turn on while away|remote control|away mode|vacation mode\",\"Cloud / remote access symptoms (Connectivity > Cloud); Schedules; Astro Timer Random vacation mode (hardware). If the ask is recurring automation it is Schedules; on-demand control from elsewhere is this.\"\nIntegrations,Third-party control via voice assistants and smart-home platforms,\"works with Alexa|Alexa won't turn on the lights|keeps unsyncing with Alexa|Google Home|SmartThings|Home Assistant|Control4|Clare|connect to my alarm|alarm.com app|the alarm app|smart locks (often a misattributed integration ask)\",\"External System field (Alexa, Google Assistant, Alarm.com, SmartThings, Control4, Clare, Home Assistant). Symptom maps to Connectivity > Integration Link, not Cloud. Supported list per site: Alexa, Google, Alarm.com, SmartThings, Control4, Clare, Home Assistant.\"\nPairing / Onboarding,First-time setup adding a smart product to the app with LED status feedback,\"hit the button and pair for five seconds|flashes blue|blue then green|pair light goes away|flashed purple not red|scanned the switches|won't pair\",\"WiFi reconnection issues. Pairing is first-time setup (Install > App Setup / Pairing); reconnection is Connectivity. LED decode (Gen 1 + Smart Dimmer configure button; Gen 2 Beacon bar): flashing green = booting; flashing blue = pairing mode; flashing purple = linking mode or firmware update; flashing white = pairing/linking in progress; solid white = success; solid red = factory resetting; red twice = action failed; white+red = can't reach WiFi/servers; purple+red = linking error; blue+red = pairing error; red+yellow = critical error (contact support).\"\nLinking (multiway setup),Joining multiple smart switches on one circuit so they control the same light,\"linking|won't link|magic linking|connect the master and remote|switches act independently\",\"Pairing (app onboarding) vs linking (switch-to-switch). Gen 2 uses Magic Linking (automatic; beacon turns off when done; 2-min timeout; can cross-link if two circuits link simultaneously). Gen 1 and Smart Dimmers link manually via configure button (green to purple to white, ~45s). Mixed Gen1+Gen2 in one circuit cannot link: each acts single-pole.\"\n\n## DISAMBIGUATION RULES\n\n# Classifier Disambiguation Notes\n\nCross-cutting rules that do not fit a single row in product_reference.csv or feature_glossary.csv. Drop these into the taxonomy prompt alongside the two tables.\n\nSources: deako.com product pages + support KB crawl (2026-06-10), 1,464 Ticket Message entries from Call Reports Dec 2025 - May 2026, deako_replacement_ticket_classification.json, taxonomy v11 serial prefix table, IBS 2026 Product Refresher deck.\n\n## Hard rules\n\n1. Slider vs rocker is the smart/simple dimmer tell. Simple Dimmer = physical slide lever + trim wheel, zero LEDs. Smart Dimmer = rocker press with 7-LED level bar + configure LED. \"Slider won't stay\" is always Simple Dimmer.\n2. Master vs Remote vs Single Pole Smart Dimmer is points-of-control, not appearance. Faces are identical; Master/Remote is printed on the back. Tells: serial prefix (231/232/233), the words master/remote, or count of switch locations (\"dimmer with two switches\" = Master+Remote).\n3. Gen 1 vs Gen 2 Smart Switch: Gen 2 has the Beacon light bar; Gen 1 has only a small bottom-center configure LED. Serial 322 vs 221. Gen 2 requires the new app. Mixed generations in one circuit cannot link and each acts single-pole.\n4. Single-pole-only products: Motion Switch, Nightlight, Simple Timer, Ventilation Timer, Astronomical Timer, Fan Speed Controller. A \"fits but doesn't work right\" ticket on any of these in a multi-switch room is likely a single-pole module in a multiway circuit.\n5. Multiway-capable: Simple Rocker, Simple Dimmer (max one per circuit), Smart Switch Gen 1/Gen 2, Smart Dimmer (Master/Remote).\n6. All wired Deako switches require a neutral. \"No power\" on a fresh install maps to root cause User Error > Installation > Missing Neutral Wire as a strong hypothesis.\n7. \"Smart outlet\" means Smart Plug. All in-wall outlets are simple and hardwired (not modular).\n8. Glowing switch ambiguity: Nightlight (fixed warm-white, daylight sensor) vs Smart Switch Gen 2 Beacon in Locator Mode (app-configurable). If the customer has an app, lean Gen 2.\n9. Timer triage: screen = Astronomical Timer; 10/30/60 buttons = Ventilation or Simple Timer (physically near-identical; bathroom-fan context does not settle it); motion-activated with 30s/5m/20m settings = Motion Switch; set in the app = Timers feature on a smart product; clock/sunset in the app = Schedules feature.\n10. \"Deako Connector\" (2026 rename) = backplate. Do not confuse with Deako Connect, the discontinued hub.\n11. Transcription garble: Deco, Decco, GEICO = Deako. Phone-channel tickets especially.\n12. LED color language signals a SMART product (configure button or Beacon). Decode in feature_glossary Pairing row. Distinguish first-time pairing (Install > App Setup / Pairing) from reconnection (Connectivity).\n13. Customers say \"timer\" for schedules constantly. Sun- or clock-based = Schedules. Duration-based = Timers.\n14. Fan tickets: speed control = Fan Speed Controller; fan light not working = NOT the fan controller's function (it never controls the light); timed shutoff on exhaust fan = Ventilation/Simple Timer; \"fan won't work with remote/smart fan\" = known incompatibility (Design / Limitation).\n\n## Taxonomy gaps found (need Pierce's decision)\n\n- Simple Timer Switch is a live retail SKU but the taxonomy only has Ventilation Timer and Astronomical Timer. Add a value or document that Ventilation Timer absorbs it.\n- Legacy products appear in old tickets but have no taxonomy value: Smart Scene Controller Dimmer (self-toucher failure cluster 2021-2022), Smart Scene Controller Switch, Deako Connect (hub, EOL, free upgrade path).\n- Current retail Simple Rocker is one unified SKU for single-pole/3-way/4-way; the taxonomy's three rocker values (013/016/012) only distinguish older inventory. Fine to keep, but expect evidence for the split to be thin on new tickets.\n- Smart Switch Multiway (serial 220) similarly mostly identifies older units.\n\n## Severity flags\n\n- Hardware > Electrical must carry the severity flag: Breaker Tripping, Overheating/Thermal Shutoff, fire/burn reports (esp. backplates: \"caught fire\", \"smelled burned\") = safety-critical; Dimming Issues, Flickering = not.\n- Multi-unit failures in one home (4-10 rockers) = possible batch/lot defect; flag for engineering escalation.\n\n## Audit items remaining for Pierce\n\n1. Simple Dimmer (Square): customer-visible tell beyond serial 062.\n2. Motion Switch: confirm no smart motion variant exists.\n3. Legacy product mapping decisions (above).\n4. Simple Timer taxonomy gap decision.\n";
+
+// ============================================================
+// PRODUCT EVAL  (added v2.5.64)
+// Measures product_primary accuracy against RMA ground truth
+// (rma_ground_truth_v1.csv imported to the "RMA Ground Truth" tab).
+// Two modes per ticket: "baseline" (current taxonomy prompt) and
+// "grounded" (taxonomy prompt + GROUNDING_REFERENCE_V1).
+// Same tickets, same model; the only variable is the reference.
+//
+// SETUP:
+// 1. File > Import rma_ground_truth_v1.csv > Insert new sheet > rename to "RMA Ground Truth"
+// 2. Run buildEvalSample()  (marks a stratified sample, caps each product class)
+// 3. Run setupEvalTrigger() (processes batches every 5 min; auto-cleans when done)
+//    or run evalNextBatch() manually as many times as needed
+// 4. Results land in "Product Eval"; summary auto-writes on completion
+//    (or run writeEvalSummary() anytime)
+// ============================================================
+
+const EVAL_CONFIG = {
+  groundTruthSheet: "RMA Ground Truth",
+  resultsSheet: "Product Eval",
+  batchSize: 8,            // tickets per run (x2 modes = 16 Claude calls)
+  samplePerClassCap: 25,   // stratification cap so rockers cannot dominate
+  model: "claude-haiku-4-5-20251001",
+};
+
+// Canonical labels with no valid taxonomy answer: family-scored only, excluded from exact accuracy
+const EVAL_LEGACY_CLASSES = ["Smart Scene Controller Dimmer (legacy)", "Smart Scene Controller Switch (legacy)", "Deako Connect (legacy)"];
+
+function evalFamilyOf(name) {
+  const n = (name || "").toLowerCase();
+  if (!n || n.indexOf("unknown") >= 0 || n.indexOf("no specific") >= 0 || n.indexOf("not mentioned") >= 0) return "";
+  if (n.indexOf("dimmer") >= 0) return "Dimmer";
+  if (n.indexOf("plug") >= 0) return "Plug";
+  if (n.indexOf("outlet") >= 0) return "Outlet";
+  if (n.indexOf("backplate") >= 0 || n.indexOf("faceplate") >= 0 || n.indexOf("connect (legacy)") >= 0 || n.indexOf("nightlight") >= 0) {
+    if (n.indexOf("nightlight") >= 0) return "Switch";
+    return "Accessory";
+  }
+  if (n.indexOf("app") >= 0) return "App";
+  if (n.indexOf("switch") >= 0 || n.indexOf("rocker") >= 0 || n.indexOf("timer") >= 0 || n.indexOf("motion") >= 0 || n.indexOf("fan") >= 0) return "Switch";
+  return "";
+}
+
+function evalScoreProduct(predictedRaw, canonical) {
+  const pred = (predictedRaw || "").trim();
+  const predL = pred.toLowerCase();
+  const isNull = !pred || ["unknown / not mentioned", "no specific product", "null", "none", "smart product - unspecified", "simple product - unspecified"].indexOf(predL) >= 0;
+  const canonParts = canonical.split("|").map(s => s.trim());
+  const isLegacy = canonParts.some(c => EVAL_LEGACY_CLASSES.indexOf(c) >= 0);
+
+  let exact = false;
+  if (!isNull) {
+    for (const c of canonParts) {
+      const cL = c.toLowerCase();
+      if (cL === "rocker (any)") {
+        if (predL.indexOf("rocker") >= 0) exact = true;
+      } else if (cL === "simple timer (taxonomy gap)") {
+        if (predL === "ventilation timer" || predL.indexOf("simple timer") >= 0) exact = true;
+      } else if (predL === cL) {
+        exact = true;
+      }
+    }
+  }
+
+  let family = false;
+  if (!isNull) {
+    const predFam = evalFamilyOf(pred);
+    const canonFams = canonParts.map(c => (c.toLowerCase() === "rocker (any)") ? "Switch" : evalFamilyOf(c));
+    family = !!predFam && canonFams.indexOf(predFam) >= 0;
+  }
+  return { isNull: isNull, exact: exact, family: family, legacyExcluded: isLegacy };
+}
+
+function buildEvalSample() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(EVAL_CONFIG.groundTruthSheet);
+  if (!sheet) throw new Error('Import rma_ground_truth_v1.csv as a tab named "' + EVAL_CONFIG.groundTruthSheet + '" first');
+  const data = sheet.getDataRange().getValues();
+  const counts = {};
+  let marked = 0;
+  const flags = [["in_sample"]];
+  for (let i = 1; i < data.length; i++) {
+    const canonical = String(data[i][9] || "");
+    const primary = canonical.split("|")[0].trim() || "(none)";
+    counts[primary] = (counts[primary] || 0) + 1;
+    const inSample = canonical && counts[primary] <= EVAL_CONFIG.samplePerClassCap ? 1 : "";
+    if (inSample) marked++;
+    flags.push([inSample]);
+  }
+  sheet.getRange(1, 11, flags.length, 1).setValues(flags);
+  Logger.log("Eval sample marked: " + marked + " tickets (cap " + EVAL_CONFIG.samplePerClassCap + " per class)");
+  try { ss.toast("Sample: " + marked + " tickets", "Eval", 5); } catch (e) {}
+}
+
+function getOrCreateEvalResultsSheet_(ss) {
+  let sheet = ss.getSheetByName(EVAL_CONFIG.resultsSheet);
+  if (!sheet) {
+    sheet = ss.insertSheet(EVAL_CONFIG.resultsSheet);
+    sheet.appendRow(["ticket_id", "mode", "canonical", "predicted", "confidence", "exact", "family", "null", "legacy_excluded", "subject", "evaluated_at"]);
+    sheet.getRange(1, 1, 1, 11).setFontWeight("bold").setBackground(BRAND.beigeLight);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function evalNextBatch() {
+  const props = PropertiesService.getScriptProperties();
+  const apiKey = props.getProperty("ANTHROPIC_API_KEY");
+  const zdToken = props.getProperty("ZENDESK_TOKEN");
+  if (!apiKey || !zdToken) throw new Error("ANTHROPIC_API_KEY and ZENDESK_TOKEN required in Script Properties");
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const gtSheet = ss.getSheetByName(EVAL_CONFIG.groundTruthSheet);
+  if (!gtSheet) throw new Error("Ground truth tab missing; see PRODUCT EVAL setup comment");
+  const results = getOrCreateEvalResultsSheet_(ss);
+
+  // done set: ticket_id|mode
+  const done = new Set();
+  const resData = results.getDataRange().getValues();
+  for (let i = 1; i < resData.length; i++) done.add(String(resData[i][0]) + "|" + String(resData[i][1]));
+
+  const gt = gtSheet.getDataRange().getValues();
+  const subdomain = CONFIG.zendesk.subdomain;
+  const zdOpts = { method: "get", headers: { "Authorization": "Basic " + Utilities.base64Encode(zdToken), "Content-Type": "application/json" }, muteHttpExceptions: true };
+
+  let processed = 0;
+  for (let i = 1; i < gt.length && processed < EVAL_CONFIG.batchSize; i++) {
+    if (!gt[i][10]) continue; // not in sample
+    const ticketId = String(gt[i][0]);
+    const canonical = String(gt[i][9] || "");
+    const modesNeeded = ["baseline", "grounded"].filter(m => !done.has(ticketId + "|" + m));
+    if (modesNeeded.length === 0) continue;
+
+    // fetch ticket + comments once
+    let ticket = null, comments = "";
+    try {
+      const tResp = UrlFetchApp.fetch(`https://${subdomain}.zendesk.com/api/v2/tickets/${ticketId}.json`, zdOpts);
+      if (tResp.getResponseCode() !== 200) {
+        results.appendRow([ticketId, "fetch_error", canonical, "HTTP " + tResp.getResponseCode(), "", "", "", "", "", "", new Date().toISOString()]);
+        done.add(ticketId + "|baseline"); done.add(ticketId + "|grounded");
+        processed++;
+        continue;
+      }
+      ticket = JSON.parse(tResp.getContentText()).ticket;
+      const cResp = UrlFetchApp.fetch(`https://${subdomain}.zendesk.com/api/v2/tickets/${ticketId}/comments.json?per_page=50`, zdOpts);
+      if (cResp.getResponseCode() === 200) {
+        comments = (JSON.parse(cResp.getContentText()).comments || []).map(c => {
+          const pub = c.public ? "PUBLIC" : "INTERNAL";
+          return `[Author ${c.author_id || "?"}] (${pub}):\n` + (c.plain_body || c.body || "").substring(0, 1500);
+        }).join("\n---\n");
+      }
+    } catch (e) {
+      Logger.log("Eval fetch failed #" + ticketId + ": " + e);
+      continue;
+    }
+
+    const channel = ticket.via && ticket.via.channel ? ticket.via.channel : "unknown";
+    const userMessage = `TICKET #${ticket.id}\nSubject: ${ticket.subject || "(no subject)"}\nStatus: ${ticket.status}\nChannel: ${channel}\nTags: ${(ticket.tags || []).join(", ")}\nCreated: ${ticket.created_at}\nUpdated: ${ticket.updated_at}\n\nDESCRIPTION:\n${(ticket.description || "").substring(0, 2000)}\n\nALL COMMENTS:\n${comments || "(no comments)"}\n\nClassify this ticket.`;
+
+    for (const mode of modesNeeded) {
+      const system = [{ type: "text", text: TAXONOMY_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }];
+      if (mode === "grounded") system.push({ type: "text", text: GROUNDING_REFERENCE_V1, cache_control: { type: "ephemeral" } });
+      try {
+        const resp = UrlFetchApp.fetch("https://api.anthropic.com/v1/messages", {
+          method: "post",
+          headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31", "Content-Type": "application/json" },
+          payload: JSON.stringify({ model: EVAL_CONFIG.model, max_tokens: 1200, system: system, messages: [{ role: "user", content: userMessage }] }),
+          muteHttpExceptions: true,
+        });
+        let predicted = "", confidence = "";
+        if (resp.getResponseCode() === 200) {
+          const raw = JSON.parse(resp.getContentText()).content[0].text.trim();
+          let parsed = {};
+          try { parsed = JSON.parse(raw); } catch (e) {
+            const m = raw.match(/\{[\s\S]*\}/);
+            if (m) { try { parsed = JSON.parse(m[0]); } catch (e2) {} }
+          }
+          const pp = parsed.product_primary;
+          if (pp && typeof pp === "object") { predicted = pp.value || ""; confidence = pp.confidence != null ? pp.confidence : ""; }
+          else if (typeof pp === "string") predicted = pp;
+        } else {
+          predicted = "API_ERROR_" + resp.getResponseCode();
+        }
+        const score = evalScoreProduct(predicted, canonical);
+        results.appendRow([ticketId, mode, canonical, predicted, confidence, score.exact ? 1 : 0, score.family ? 1 : 0, score.isNull ? 1 : 0, score.legacyExcluded ? 1 : 0, (ticket.subject || "").substring(0, 120), new Date().toISOString()]);
+        done.add(ticketId + "|" + mode);
+      } catch (e) {
+        Logger.log("Eval classify failed #" + ticketId + " " + mode + ": " + e);
+      }
+    }
+    processed++;
+  }
+
+  if (processed === 0) {
+    Logger.log("Eval complete: no remaining sampled tickets");
+    cleanupEvalTrigger();
+    writeEvalSummary();
+  } else {
+    Logger.log("Eval batch done: " + processed + " tickets this run");
+  }
+}
+
+function writeEvalSummary() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const results = ss.getSheetByName(EVAL_CONFIG.resultsSheet);
+  if (!results) throw new Error("No results yet");
+  const data = results.getDataRange().getValues();
+  const stats = {}; // mode -> aggregates
+  const perClass = {}; // mode -> class -> {n, exact}
+  for (let i = 1; i < data.length; i++) {
+    const [tid, mode, canonical, predicted, conf, exact, family, isNull, legacyEx] = data[i];
+    if (mode !== "baseline" && mode !== "grounded") continue;
+    if (!stats[mode]) stats[mode] = { n: 0, exactN: 0, exact: 0, family: 0, nulls: 0 };
+    const s = stats[mode];
+    s.n++;
+    s.family += Number(family) || 0;
+    s.nulls += Number(isNull) || 0;
+    if (!Number(legacyEx)) { s.exactN++; s.exact += Number(exact) || 0; }
+    const cls = String(canonical).split("|")[0];
+    if (!perClass[mode]) perClass[mode] = {};
+    if (!perClass[mode][cls]) perClass[mode][cls] = { n: 0, exact: 0 };
+    perClass[mode][cls].n++;
+    perClass[mode][cls].exact += Number(exact) || 0;
+  }
+
+  const sheet = getOrCreateSheet(ss, "Product Eval Summary");
+  sheet.clear();
+  const rows = [["PRODUCT EVAL SUMMARY", "", "", "", ""], ["mode", "tickets", "exact acc (excl legacy)", "family acc", "null rate"]];
+  ["baseline", "grounded"].forEach(m => {
+    const s = stats[m];
+    if (!s) return;
+    rows.push([m, s.n, s.exactN ? (100 * s.exact / s.exactN).toFixed(1) + "%" : "n/a", (100 * s.family / s.n).toFixed(1) + "%", (100 * s.nulls / s.n).toFixed(1) + "%"]);
+  });
+  rows.push(["", "", "", "", ""]);
+  rows.push(["per-class exact accuracy", "class", "baseline", "grounded", "n"]);
+  const classes = Object.keys(perClass.grounded || perClass.baseline || {}).sort();
+  classes.forEach(cls => {
+    const b = (perClass.baseline || {})[cls];
+    const g = (perClass.grounded || {})[cls];
+    rows.push(["", cls, b ? (100 * b.exact / b.n).toFixed(0) + "%" : "-", g ? (100 * g.exact / g.n).toFixed(0) + "%" : "-", (g || b || { n: 0 }).n]);
+  });
+  sheet.getRange(1, 1, rows.length, 5).setValues(rows);
+  sheet.getRange(1, 1).setFontWeight("bold").setFontSize(12);
+  sheet.getRange(2, 1, 1, 5).setFontWeight("bold").setBackground(BRAND.beigeLight);
+  sheet.autoResizeColumns(1, 5);
+  sheet.getRange(rows.length + 2, 1).setValue("Built " + new Date().toISOString() + " - CS Visibility v2.5.64 - baseline vs grounded product_primary eval on RMA ground truth. Rocker (any) accepts any rocker value; legacy classes excluded from exact accuracy; null = model abstained.");
+  Logger.log("Eval summary written");
+}
+
+function setupEvalTrigger() {
+  cleanupEvalTrigger();
+  ScriptApp.newTrigger("evalNextBatch").timeBased().everyMinutes(5).create();
+  Logger.log("Eval trigger created (every 5 min). It removes itself when the sample is exhausted.");
+}
+
+function cleanupEvalTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "evalNextBatch") ScriptApp.deleteTrigger(t);
+  });
+}

@@ -11,6 +11,15 @@ Thumbs.db
 *.csv
 *.zip
 
+# Images and slide decks (internal metrics) — keep only the 3 approved screenshots below
+*.jpg
+*.jpeg
+*.png
+*.pptx
+*.xlsx
+/qbr/
+/_qa*
+
 # Documents and internal files
 *.docx
 *.pdf
@@ -18,6 +27,7 @@ Thumbs.db
 *.json
 *.md
 *.txt
+*.sql
 !README.md
 
 # Source files (keep only the v2 script)
